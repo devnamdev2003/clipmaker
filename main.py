@@ -8,6 +8,11 @@ If the Gemini API fails (bad key, quota, network, invalid JSON, wrong clips ...)
 the app does NOT stop. It prepares a transcript file + prompt and asks you to run
 it manually in the Gemini chat website, then paste the JSON answer back here.
 
+Clip editor: after the AI picks the clips, an editor opens that plays the video straight from
+YouTube (nothing is downloaded yet). For every clip you set start/end time and output width/height,
+then press "Generate clips" - only then is the video downloaded and the clips are cut.
+(Optional: pip install pywebview  ->  the editor opens in its own window instead of the browser.)
+
 Install once:
     pip install customtkinter yt-dlp python-dotenv google-genai
 Also needs FFmpeg + ffprobe on PATH.
@@ -29,6 +34,10 @@ import threading
 import time
 import traceback
 import webbrowser
+import importlib.util
+import secrets
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,6 +76,7 @@ MAX_AI_ATTEMPTS = 3
 CLIP_TOLERANCE = 1.0  # seconds of slack allowed around the chosen duration range
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 GEMINI_URL = "https://gemini.google.com/app"
+SIZE_DEFAULT = "default"  # clip uses the sidebar "Output shape" setting
 
 QUALITY_OPTIONS = {
     "Best available": "bestvideo+bestaudio/best",
@@ -190,6 +200,7 @@ class Clip:
     description: str
     start: float
     end: float
+    size: object = SIZE_DEFAULT  # SIZE_DEFAULT | None (original) | (width, height)
 
     @property
     def length(self):
@@ -631,7 +642,7 @@ def fit_to_duration(clips, duration):
         if end - clip.start < 1:
             dropped.append(clip)
             continue
-        kept.append(Clip(clip.rank, clip.title, clip.description, clip.start, end))
+        kept.append(Clip(clip.rank, clip.title, clip.description, clip.start, end, clip.size))
     return kept, dropped
 
 
@@ -884,6 +895,318 @@ def call_gemini(prompt):
     if not text:
         raise ValueError("Gemini returned an empty answer (it may have been blocked).")
     return text
+
+
+# --------------------------------------------------------------------------- #
+# Clip editor (watch the video from YouTube, set time + size for every clip)
+# --------------------------------------------------------------------------- #
+def clip_summary(clip):
+    text = f"{format_timestamp(clip.start)} to {format_timestamp(clip.end)}, {clip.length:.0f} seconds"
+    if clip.size != SIZE_DEFAULT:
+        text += f", {clip.size[0]}×{clip.size[1]}" if clip.size else ", original size"
+    return text
+
+
+def clip_output_size(clip, default_size):
+    """Per-clip size from the editor, otherwise the 'Output shape' chosen in the sidebar."""
+    return default_size if clip.size == SIZE_DEFAULT else clip.size
+
+
+class EditorSession:
+    """Everything the editor page needs to know about the current video."""
+
+    def __init__(self, video_id, title, duration, embeddable, clips, default_size):
+        self.video_id = video_id
+        self.title = title
+        self.duration = duration
+        self.embeddable = embeddable
+        self.clips = clips
+        self.default_size = default_size
+
+    def data(self):
+        items = []
+        for clip in self.clips:
+            size = self.default_size if clip.size == SIZE_DEFAULT else clip.size
+            items.append({
+                "rank": clip.rank, "title": clip.title, "description": clip.description,
+                "start": round(clip.start, 2), "end": round(clip.end, 2),
+                "width": size[0] if size else None, "height": size[1] if size else None,
+            })
+        return {
+            "video_id": self.video_id, "title": self.title, "duration": self.duration,
+            "embeddable": self.embeddable, "clips": items,
+        }
+
+
+EDITOR_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Clip editor</title>
+<style>
+:root{--bg:#16181d;--panel:#1f2229;--raised:#272b34;--line:#343945;--text:#e8e6e1;--soft:#c3c7d1;--muted:#8d93a0;
+--accent:#8b9bff;--accent-h:#7686f0;--good:#5fc9a0;--bad:#ef6a6a;--warn:#e8b04a;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Segoe UI",system-ui,sans-serif}
+header{padding:16px 24px;border-bottom:1px solid var(--line)}
+h1{font-size:18px;margin:0 0 2px}
+.sub{color:var(--muted);font-size:12px}
+main{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(380px,1fr);gap:18px;padding:18px 24px 100px}
+@media(max-width:980px){main{grid-template-columns:1fr}.stage{position:static!important}}
+.stage{position:sticky;top:14px;align-self:start}
+.player-box{position:relative;aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden;border:1px solid var(--line)}
+#player,#player iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+#crop{position:absolute;pointer-events:none;border:2px solid var(--accent);border-radius:3px;
+box-shadow:0 0 0 9999px rgba(10,12,16,.62);display:none}
+.under{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:10px;color:var(--soft);font-size:13px;flex-wrap:wrap}
+.under label{display:flex;gap:6px;align-items:center;cursor:pointer}
+#now{font-variant-numeric:tabular-nums}
+.banner{margin-top:10px;padding:10px 12px;border-radius:8px;background:#3a2f17;color:var(--warn);font-size:13px;display:none}
+.hint{margin-top:10px;color:var(--muted);font-size:12px}
+#list{display:flex;flex-direction:column;gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;cursor:pointer}
+.card.active{border-color:var(--accent)}
+.card.off{opacity:.5}
+.chead{display:flex;gap:8px;align-items:center}
+.rank{background:var(--raised);color:var(--accent);border-radius:8px;padding:2px 8px;font-weight:700;font-size:13px}
+.title{flex:1;min-width:0}
+input,select{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:6px 8px;font:inherit}
+input:focus,select:focus{outline:none;border-color:var(--accent)}
+input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent)}
+.t{width:92px;font-variant-numeric:tabular-nums}
+.n{width:78px}
+.bar{height:6px;background:var(--raised);border-radius:3px;margin:10px 0 8px;position:relative;overflow:hidden}
+.bar i{position:absolute;top:0;bottom:0;background:var(--accent);border-radius:3px}
+.row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px}
+.row .lab{width:42px;color:var(--soft);font-size:12px}
+button{font:inherit;cursor:pointer;border:1px solid var(--line);background:var(--raised);color:var(--text);border-radius:7px;padding:5px 9px}
+button:hover{background:var(--line)}
+.mini{padding:3px 7px;font-size:12px}
+.primary{background:var(--accent);color:#10131c;border-color:var(--accent);font-weight:700;padding:10px 22px;font-size:15px;border-radius:9px}
+.primary:hover{background:var(--accent-h)}
+.primary:disabled{opacity:.5;cursor:default}
+.len{margin-top:8px;font-size:12px;color:var(--muted)}
+.err{font-size:12px;color:var(--bad);min-height:0}
+footer{position:fixed;left:0;right:0;bottom:0;background:var(--panel);border-top:1px solid var(--line);
+padding:12px 24px;display:flex;align-items:center;gap:16px;justify-content:space-between}
+#msg{font-size:13px;color:var(--soft)}
+#msg.bad{color:var(--bad)}
+#done{position:fixed;inset:0;background:rgba(16,18,24,.96);display:none;align-items:center;justify-content:center;text-align:center;padding:30px}
+#done h2{margin:0 0 8px}
+</style></head>
+<body>
+<header><h1 id="vtitle">Clip editor</h1>
+<div class="sub">Watch the video straight from YouTube, set each clip's time and size, then press Generate. Nothing is downloaded until you do.</div></header>
+<main>
+ <section class="stage">
+  <div class="player-box"><div id="player"></div><div id="crop"></div></div>
+  <div class="banner" id="banner"></div>
+  <div class="under">
+   <span>Now: <b id="now">00:00.0</b> / <span id="total">--:--</span></span>
+   <label><input type="checkbox" id="showcrop" checked> Show the crop frame of the selected clip</label>
+  </div>
+  <div class="hint">Pause on the exact frame, then press <b>Set = now</b> on a clip. Click a clip to select it and see its crop frame.
+  Width and height must be even numbers; the video is scaled to fill the frame and cropped from the centre.</div>
+ </section>
+ <section id="list"></section>
+</main>
+<footer>
+ <div id="msg"></div>
+ <button class="primary" id="gen">Generate clips</button>
+</footer>
+<div id="done"><div><h2>Sent to the app</h2>
+<div class="sub" style="font-size:14px">The video is downloading and your clips are being created.<br>Go back to Viral Clips Studio to watch the progress. You can close this window.</div></div></div>
+<script type="application/json" id="data">__DATA__</script>
+<script>
+const D=JSON.parse(document.getElementById('data').textContent);
+const $=s=>document.querySelector(s);
+const clips=D.clips.map(c=>({...c,enabled:true}));
+let active=0,player=null,ready=false,stopAt=null,duration=D.duration||0;
+const PRESETS=[["Original size",null,null],["Vertical 9:16 (1080×1920)",1080,1920],["Horizontal 16:9 (1920×1080)",1920,1080],
+["Square 1:1 (1080×1080)",1080,1080],["Portrait 4:5 (1080×1350)",1080,1350],["Custom size",0,0]];
+
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function fmt(t){t=Math.max(0,t||0);const h=Math.floor(t/3600),m=Math.floor(t%3600/60),s=(t%60).toFixed(1).padStart(4,'0');
+ return (h?String(h).padStart(2,'0')+':':'')+String(m).padStart(2,'0')+':'+s}
+function parse(v){v=String(v).trim().replace(',','.');if(/^\d+(\.\d+)?$/.test(v))return parseFloat(v);
+ const p=v.split(':');if(p.length<2||p.length>3||!p.every(x=>/^\d+(\.\d+)?$/.test(x)))return NaN;
+ return p.map(Number).reduce((a,b)=>a*60+b,0)}
+function presetIndex(c){if(!c.width&&!c.height)return 0;
+ const i=PRESETS.findIndex((p,k)=>k>0&&k<PRESETS.length-1&&p[1]===c.width&&p[2]===c.height);return i<0?PRESETS.length-1:i}
+
+function cardHTML(c,i){
+ const nudge=w=>[-1,-0.1,0.1,1].map(d=>`<button class="mini" data-act="${w}" data-d="${d}">${d>0?'+':'−'}${Math.abs(d)}s</button>`).join('');
+ return `<div class="card" data-i="${i}">
+ <div class="chead"><input type="checkbox" class="en" checked title="Include this clip">
+  <span class="rank">#${c.rank}</span><input class="title" value="${esc(c.title)}">
+  <button data-act="play">▶ Preview</button></div>
+ <div class="bar"><i></i></div>
+ <div class="row"><span class="lab">Start</span><input class="t" data-f="start"> <button class="mini" data-act="now" data-w="start">Set = now</button>${nudge('s')}</div>
+ <div class="row"><span class="lab">End</span><input class="t" data-f="end"> <button class="mini" data-act="now" data-w="end">Set = now</button>${nudge('e')}</div>
+ <div class="row"><span class="lab">Size</span><select class="preset">${PRESETS.map((p,k)=>`<option value="${k}">${p[0]}</option>`).join('')}</select>
+  <input class="n" type="number" min="100" max="4096" step="2" data-f="width" placeholder="width"> ×
+  <input class="n" type="number" min="100" max="4096" step="2" data-f="height" placeholder="height"></div>
+ <div class="len"></div><div class="err"></div></div>`}
+
+function validate(c){
+ if(!(c.end>c.start+0.5))return'the end must be after the start';
+ if(duration&&c.start>=duration)return'the start is after the end of the video';
+ if(!!c.width!==!!c.height)return'set both width and height (or neither)';
+ if(c.width&&(c.width<100||c.width>4096||c.height<100||c.height>4096))return'width and height must be between 100 and 4096';
+ return''}
+
+function sync(i){
+ const c=clips[i],el=$(`.card[data-i="${i}"]`);
+ const set=(sel,v)=>{const n=el.querySelector(sel);if(document.activeElement!==n)n.value=v};
+ set('[data-f=start]',fmt(c.start));set('[data-f=end]',fmt(c.end));
+ set('[data-f=width]',c.width||'');set('[data-f=height]',c.height||'');
+ el.querySelector('.preset').value=presetIndex(c);
+ const bar=el.querySelector('.bar i'),d=duration||Math.max(c.end,1);
+ bar.style.left=Math.min(100,c.start/d*100)+'%';bar.style.width=Math.max(0.6,Math.min(100-c.start/d*100,(c.end-c.start)/d*100))+'%';
+ el.querySelector('.len').textContent=`Length ${Math.max(0,c.end-c.start).toFixed(1)} s`+(c.width?`  ·  output ${c.width}×${c.height}`:'  ·  original size');
+ el.querySelector('.err').textContent=validate(c);
+ el.classList.toggle('off',!c.enabled);
+ if(i===active)overlay()}
+
+function overlay(){
+ const c=clips[active],el=$('#crop');
+ if(!c||!$('#showcrop').checked||!c.width||!c.height){el.style.display='none';return}
+ const sa=16/9,oa=c.width/c.height;let w=1,h=1;if(oa<sa)w=oa/sa;else h=sa/oa;
+ Object.assign(el.style,{display:'block',width:w*100+'%',height:h*100+'%',left:(1-w)/2*100+'%',top:(1-h)/2*100+'%'})}
+
+function select(i){active=i;document.querySelectorAll('.card').forEach(n=>n.classList.toggle('active',+n.dataset.i===i));overlay()}
+function seek(t){if(ready){player.seekTo(Math.max(0,t),true);player.pauseVideo();stopAt=null}}
+function setTime(i,w,v){const c=clips[i];if(isNaN(v))return;v=Math.max(0,duration?Math.min(v,duration):v);c[w]=Math.round(v*10)/10;sync(i);seek(w==='start'?c.start:c.end-0.3)}
+
+$('#list').innerHTML=clips.map(cardHTML).join('');
+clips.forEach((_,i)=>sync(i));
+$('#vtitle').textContent=D.title||'Clip editor';
+select(0);
+
+$('#list').addEventListener('click',e=>{
+ const card=e.target.closest('.card');if(!card)return;const i=+card.dataset.i,c=clips[i];
+ if(!e.target.closest('input[type=checkbox]'))select(i);
+ const b=e.target.closest('button');if(!b)return;const a=b.dataset.act;
+ if(a==='play'&&ready){player.seekTo(c.start,true);player.playVideo();stopAt=c.end}
+ else if(a==='now'&&ready)setTime(i,b.dataset.w,player.getCurrentTime());
+ else if(a==='s')setTime(i,'start',c.start+ +b.dataset.d);
+ else if(a==='e')setTime(i,'end',c.end+ +b.dataset.d)});
+$('#list').addEventListener('change',e=>{
+ const card=e.target.closest('.card');if(!card)return;const i=+card.dataset.i,c=clips[i],t=e.target;
+ if(t.classList.contains('en')){c.enabled=t.checked;sync(i)}
+ else if(t.classList.contains('title'))c.title=t.value;
+ else if(t.classList.contains('preset')){const p=PRESETS[+t.value];if(+t.value<PRESETS.length-1){c.width=p[1];c.height=p[2]}else{c.width=c.width||1080;c.height=c.height||1920}sync(i)}
+ else if(t.dataset.f==='start'||t.dataset.f==='end'){const v=parse(t.value);if(isNaN(v)){sync(i);$('#msg').textContent='Time format: 90, 1:30 or 1:02:03.5';return}setTime(i,t.dataset.f,v)}
+ else if(t.dataset.f==='width'||t.dataset.f==='height'){const v=parseInt(t.value,10);c[t.dataset.f]=isNaN(v)?null:v;
+  if(!c.width&&!c.height){c.width=c.height=null}sync(i)}});
+$('#showcrop').addEventListener('change',overlay);
+
+function banner(text){const b=$('#banner');b.textContent=text;b.style.display='block'}
+if(D.embeddable===false)banner('YouTube does not allow this video to be played outside youtube.com, so the preview may stay black. You can still type the start and end times by hand.');
+window.onYouTubeIframeAPIReady=()=>{player=new YT.Player('player',{videoId:D.video_id,host:'https://www.youtube.com',
+ playerVars:{rel:0,playsinline:1,modestbranding:1,origin:location.origin},
+ events:{onReady:()=>{ready=true;duration=player.getDuration()||duration;$('#total').textContent=fmt(duration);clips.forEach((_,i)=>sync(i));seek(clips[active].start)},
+ onError:()=>banner('The video could not be played here (embedding blocked or video unavailable). You can still type the times by hand.')}})};
+const s=document.createElement('script');s.src='https://www.youtube.com/iframe_api';document.head.appendChild(s);
+setInterval(()=>{if(!ready)return;const t=player.getCurrentTime();$('#now').textContent=fmt(t);
+ if(stopAt!==null&&t>=stopAt){player.pauseVideo();stopAt=null}},120);
+
+function msg(t,bad){const m=$('#msg');m.textContent=t;m.className=bad?'bad':''}
+$('#gen').addEventListener('click',async()=>{
+ const out=[];let bad='';
+ clips.forEach(c=>{if(!c.enabled)return;const e=validate(c);if(e&&!bad)bad=`Clip #${c.rank}: ${e}.`;
+  out.push({rank:c.rank,title:c.title,description:c.description,start:c.start,end:c.end,width:c.width||null,height:c.height||null})});
+ if(bad)return msg(bad,true);
+ if(!out.length)return msg('Tick at least one clip.',true);
+ const btn=$('#gen');btn.disabled=true;msg('Sending to the app…');
+ try{const r=await fetch('/generate'+location.search,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({clips:out})});
+  const j=await r.json();if(!j.ok)throw new Error(j.error||'The app rejected the clips.');
+  if(ready)player.pauseVideo();$('#done').style.display='flex'}
+ catch(err){btn.disabled=false;msg(err.message,true)}});
+msg(`${clips.length} clips ready to edit.`);
+</script></body></html>
+"""
+
+
+class EditorServer:
+    """Tiny local web server (127.0.0.1 only, random port, secret token) that serves the editor page."""
+
+    def __init__(self, session, on_generate):
+        self.session = session
+        self.on_generate = on_generate
+        self.token = secrets.token_urlsafe(16)
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _send(self, code, body, ctype):
+                raw = body.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def _authorised(self, parsed):
+                return parse_qs(parsed.query).get("t", [""])[0] == outer.token
+
+            def do_GET(self):
+                parsed = urlparse(self.path)
+                if parsed.path != "/" or not self._authorised(parsed):
+                    self._send(404, "Not found", "text/plain; charset=utf-8")
+                    return
+                data = json.dumps(outer.session.data(), ensure_ascii=False).replace("<", "\\u003c")
+                self._send(200, EDITOR_HTML.replace("__DATA__", data), "text/html; charset=utf-8")
+
+            def do_POST(self):
+                parsed = urlparse(self.path)
+                if parsed.path != "/generate" or not self._authorised(parsed):
+                    self._send(404, "Not found", "text/plain; charset=utf-8")
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length <= 0 or length > 1_000_000:
+                        raise ValueError("Bad request size.")
+                    data = json.loads(self.rfile.read(length).decode("utf-8"))
+                    outer.on_generate(data)
+                    reply = {"ok": True}
+                    code = 200
+                except (ValueError, json.JSONDecodeError) as exc:
+                    reply, code = {"ok": False, "error": str(exc)}, 400
+                except Exception as exc:  # never let the page hang on a server error
+                    reply, code = {"ok": False, "error": f"Unexpected error: {exc}"}, 500
+                self._send(code, json.dumps(reply), "application/json; charset=utf-8")
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/?t={self.token}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        try:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+        except Exception:
+            pass
+
+
+def open_editor_window(url):
+    """Own app window if 'pywebview' is installed, otherwise the default browser."""
+    if importlib.util.find_spec("webview") is not None and not getattr(sys, "frozen", False):
+        try:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--editor-window", url])
+            return
+        except OSError:
+            pass
+    webbrowser.open(url)
+
+
+def run_editor_window(url):
+    import webview  # pip install pywebview
+    webview.create_window("Clip editor", url, width=1320, height=880)
+    webview.start()
 
 
 # --------------------------------------------------------------------------- #
@@ -1208,7 +1531,7 @@ class ClipCard(ctk.CTkFrame):
         self.title_label.grid(row=0, column=2, sticky="ew", pady=(12, 0), padx=(0, 12))
         ctk.CTkLabel(
             self, anchor="w", text_color=MUTED, font=font(12),
-            text=f"{format_timestamp(clip.start)} to {format_timestamp(clip.end)}, {clip.length:.0f} seconds",
+            text=clip_summary(clip),
         ).grid(row=1, column=2, sticky="ew", padx=(0, 12))
         self.desc_label = ctk.CTkLabel(self, text=clip.description, anchor="w", justify="left",
                                        text_color=SOFT, font=font(13), wraplength=480)
@@ -1263,6 +1586,8 @@ class ViralClipsApp(ctk.CTk):
         self.job = None
         self.cards = []
         self.review_waiter = None
+        self.editor_session = None
+        self.editor_server = None
         self.active_dialog = None
         self.last_output_folder = None
         self._alive = True
@@ -1272,7 +1597,7 @@ class ViralClipsApp(ctk.CTk):
         self.quality_var = tk.StringVar(value="720p or lower")
         self.ratio_var = tk.StringVar(value="Vertical 9:16 (Reels / Shorts)")
         self.duration_var = tk.StringVar(value="20–25 seconds")
-        self.auto_var = tk.BooleanVar(value=True)
+        self.auto_var = tk.BooleanVar(value=False)  # editor is the default path
         self.status_var = tk.StringVar(value="Ready")
 
         self.build_ui()
@@ -1328,7 +1653,7 @@ class ViralClipsApp(ctk.CTk):
         self.instructions_box.grid(row=9, column=0, sticky="ew", padx=20, pady=(4, 12))
         self.instructions_box.insert("1.0", DEFAULT_INSTRUCTIONS)
 
-        ctk.CTkSwitch(side, text="Create clips right after analysis", variable=self.auto_var,
+        ctk.CTkSwitch(side, text="Skip the editor (create clips right after analysis)", variable=self.auto_var,
                       command=self.refresh_buttons, text_color=SOFT, font=font(13),
                       progress_color=ACCENT, button_color=TEXT, button_hover_color=SOFT).grid(
             row=10, column=0, sticky="w", padx=20, pady=(2, 14))
@@ -1416,7 +1741,8 @@ class ViralClipsApp(ctk.CTk):
                                         fg_color="#5a2a2e", hover_color="#733439", text_color="#ffd9d9",
                                         font=font(13), corner_radius=8)
         self.cancel_btn.pack(side="left", padx=(0, 8))
-        self.create_btn = primary_button(buttons, "Create selected clips", self.create_selected, width=180)
+        self.edit_btn = primary_button(buttons, "Edit clips (time and size)", self.open_editor, width=210)
+        self.create_btn = quiet_button(buttons, "Create selected clips", self.create_selected, width=170, height=38)
         self.create_btn.pack(side="left", padx=(0, 8))
         self.start_btn = primary_button(buttons, "Analyze and create clips", self.on_primary, width=200)
         self.start_btn.pack(side="left")
@@ -1442,8 +1768,10 @@ class ViralClipsApp(ctk.CTk):
         if s == "review":
             self.create_btn.configure(state="normal")
             self.create_btn.pack(side="left", padx=(0, 8), before=self.start_btn)
+            self.edit_btn.pack(side="left", padx=(0, 8), before=self.create_btn)
         else:
             self.create_btn.pack_forget()
+            self.edit_btn.pack_forget()
 
     # ------------------------------------------------------ thread-safe calls
     def log(self, message, level="info"):
@@ -1557,7 +1885,57 @@ class ViralClipsApp(ctk.CTk):
         waiter, self.review_waiter = self.review_waiter, None
         self.app_state = "running"
         self.refresh_buttons()
-        waiter.resolve(selected)
+        waiter.resolve(("selected", selected))
+
+    def open_editor(self):
+        if self.app_state != "review" or not self.editor_session:
+            return
+        try:
+            if self.editor_server is None:
+                self.editor_server = EditorServer(self.editor_session, self.editor_generate)
+            open_editor_window(self.editor_server.url)
+            self.log("Clip editor opened. Set the times and sizes, then press 'Generate clips' there.")
+        except Exception as exc:
+            messagebox.showerror("Cannot open the editor", str(exc))
+
+    def editor_generate(self, data):
+        """Called from the editor's web server thread when the user presses Generate clips."""
+        items = data.get("clips") if isinstance(data, dict) else None
+        if not isinstance(items, list) or not items:
+            raise ValueError("No clips were sent.")
+        clips = []
+        for n, item in enumerate(items, 1):
+            try:
+                rank = int(item.get("rank", n))
+                start, end = float(item["start"]), float(item["end"])
+            except (KeyError, TypeError, ValueError, AttributeError):
+                raise ValueError(f"Clip {n} has unreadable times.")
+            if start < 0 or end - start < 0.5:
+                raise ValueError(f"Clip #{rank}: the end must be after the start.")
+            width, height = item.get("width"), item.get("height")
+            size = None  # original size
+            if width or height:
+                try:
+                    width, height = int(width), int(height)
+                except (TypeError, ValueError):
+                    raise ValueError(f"Clip #{rank}: set both width and height.")
+                if not (100 <= width <= 4096 and 100 <= height <= 4096):
+                    raise ValueError(f"Clip #{rank}: width and height must be between 100 and 4096.")
+                size = (width - width % 2, height - height % 2)  # H.264 needs even sizes
+            title = str(item.get("title") or f"Clip {rank}").strip()[:200]
+            clips.append(Clip(rank, title, str(item.get("description") or "").strip(), start, end, size))
+        waiter = self.review_waiter
+        if waiter is None or self.app_state != "review":
+            raise ValueError("The app is not waiting for clips right now.")
+        self.review_waiter = None
+        self.events.put(("state", "running"))
+        waiter.resolve(("edited", clips))
+
+    def close_editor(self):
+        server, self.editor_server = self.editor_server, None
+        self.editor_session = None
+        if server is not None:
+            threading.Thread(target=server.close, daemon=True).start()
 
     def cancel_job(self):
         if self.app_state not in ("running", "review") or not self.job:
@@ -1565,6 +1943,7 @@ class ViralClipsApp(ctk.CTk):
         if not messagebox.askyesno("Cancel job", "Stop the current job?"):
             return
         self.job.cancel.set()
+        self.close_editor()
         if self.active_dialog is not None:
             self.active_dialog.close(None)
         if self.review_waiter is not None:
@@ -1608,6 +1987,7 @@ class ViralClipsApp(ctk.CTk):
             if self.job:
                 self.job.cancel.set()
         self._alive = False
+        self.close_editor()
         self.destroy()
 
     # --------------------------------------------------------- event handling
@@ -1683,10 +2063,17 @@ class ViralClipsApp(ctk.CTk):
             index, text, color, path = value
             if index < len(self.cards):
                 self.cards[index].set_status(text, color, path)
+        elif kind == "open_editor":
+            self.open_editor()
+        elif kind == "sync_cards":
+            clips, waiter = value
+            self.show_clips(clips)
+            waiter.resolve(True)
         elif kind == "finished":
             self.finish_job(value)
 
     def finish_job(self, result):
+        self.close_editor()
         self.app_state = "finished"
         self.review_waiter = None
         self.refresh_buttons()
@@ -1710,8 +2097,15 @@ class ViralClipsApp(ctk.CTk):
             transcript_text = self.step_transcript(job, info)
             clips = self.step_ai(job, info, title, duration, transcript_text)
             if not job.auto_create:
-                selected = self.step_review(job)
-                clips = [clips[i] for i in selected]
+                answer = self.step_review(job, info, title, duration, clips)
+                if not answer:
+                    raise JobCancelled()
+                kind, value = answer
+                if kind == "selected":
+                    clips = [clips[i] for i in value]
+                else:  # clips edited in the editor
+                    clips = value
+                    self.sync_cards(clips)
             folder, ok, failed = self.step_download_and_cut(job, title, clips)
 
             lines = [f"Clips created: {ok}"]
@@ -1915,13 +2309,25 @@ class ViralClipsApp(ctk.CTk):
         return clips
 
     # review ---------------------------------------------------------------
-    def step_review(self, job):
+    def step_review(self, job, info, title, duration, clips):
         waiter = Waiter()
         self.review_waiter = waiter
+        default_size = job.ratio
+        self.editor_session = EditorSession(
+            info.get("id", ""), title, duration, info.get("playable_in_embed") is not False,
+            clips, default_size)
         self.events.put(("state", "review"))
-        self.set_status("Review the clips, untick any you do not want, then press 'Create selected clips'.")
-        self.log("Waiting for you to review the clips.")
+        self.events.put(("open_editor", None))
+        self.set_status("Set each clip's time and size in the editor, then press 'Generate clips' there. "
+                        "(Or use 'Create selected clips' here to skip editing.)")
+        self.log("Waiting for you in the clip editor.")
         return self.wait_for(waiter)
+
+    def sync_cards(self, clips):
+        """Rebuild the clip cards on the UI thread so they match the edited clips."""
+        waiter = Waiter()
+        self.events.put(("sync_cards", (clips, waiter)))
+        self.wait_for(waiter)
 
     # steps 4 and 5 ---------------------------------------------------------
     def step_download_and_cut(self, job, title, clips):
@@ -1973,7 +2379,8 @@ class ViralClipsApp(ctk.CTk):
             self.events.put(("clip_status", (card_index, "Creating…", ACCENT, None)))
             self.log(f"[{position}/{len(clips)}] {clip.title} ({clip.start:.1f}s to {clip.end:.1f}s)")
             try:
-                cut_clip(video_path, out_path, clip.start, clip.end, job.ratio, job.cancel)
+                cut_clip(video_path, out_path, clip.start, clip.end,
+                         clip_output_size(clip, job.ratio), job.cancel)
                 ok += 1
                 self.log(f"  Saved {out_path.name}", "ok")
                 self.events.put(("clip_status", (card_index, "Saved", GOOD, out_path)))
@@ -1995,6 +2402,9 @@ class ViralClipsApp(ctk.CTk):
 
 
 def main():
+    if "--editor-window" in sys.argv:  # child process started by open_editor_window()
+        run_editor_window(sys.argv[sys.argv.index("--editor-window") + 1])
+        return
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
     app = ViralClipsApp()
