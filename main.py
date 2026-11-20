@@ -1,13 +1,50 @@
+"""
+Viral Clips Studio
+------------------
+Paste a YouTube link -> captions are fetched -> Gemini picks the 5 best moments
+-> the clips are cut with FFmpeg.
+
+If the Gemini API fails (bad key, quota, network, invalid JSON, wrong clips ...),
+the app does NOT stop. It prepares a transcript file + prompt and asks you to run
+it manually in the Gemini chat website, then paste the JSON answer back here.
+
+Install once:
+    pip install customtkinter yt-dlp python-dotenv google-genai
+Also needs FFmpeg + ffprobe on PATH.
+
+.env file (next to main.py) - can also be edited from the Settings button:
+    GEMINI_API_KEY=your_key
+    GEMINI_MODEL=gemini-3.5-flash-lite
+    COOKIES_BROWSER=None
+"""
+
 import json
 import os
 import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
+import time
+import traceback
+import webbrowser
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from dataclasses import dataclass
 from pathlib import Path
+from tkinter import filedialog, messagebox
+
+try:
+    import customtkinter as ctk
+except ImportError:  # friendly message instead of a raw traceback
+    _root = tk.Tk()
+    _root.withdraw()
+    messagebox.showerror(
+        "Missing package",
+        "This app needs the 'customtkinter' package.\n\n"
+        "Open a terminal and run:\n    pip install customtkinter\n\nThen start the app again.",
+    )
+    sys.exit(1)
 
 import yt_dlp
 from dotenv import load_dotenv
@@ -15,15 +52,21 @@ from google import genai
 from google.genai import types
 
 
+# --------------------------------------------------------------------------- #
+# Paths, config, constants
+# --------------------------------------------------------------------------- #
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 OUTPUT_DIR = BASE_DIR / "output"
+MANUAL_DIR = BASE_DIR / "manual_gemini"
 ENV_FILE = BASE_DIR / ".env"
 
-load_dotenv(ENV_FILE)
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+REQUIRED_CLIPS = 5
+MAX_AI_ATTEMPTS = 3
+CLIP_TOLERANCE = 1.0  # seconds of slack allowed around the chosen duration range
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+GEMINI_URL = "https://gemini.google.com/app"
 
 QUALITY_OPTIONS = {
     "Best available": "bestvideo+bestaudio/best",
@@ -50,244 +93,392 @@ DURATION_OPTIONS = {
     "Any duration (10–60 seconds)": (10, 60),
 }
 
+COOKIE_BROWSERS = ["None", "chrome", "edge", "firefox", "brave", "opera", "safari"]
+
+DEFAULT_INSTRUCTIONS = "Prioritize funny moments with a strong punchline. Keep the full setup and reaction."
+
+STEPS = ["Video info", "Transcript", "AI analysis", "Download", "Create clips"]
+
+FFMPEG_HELP = (
+    "FFmpeg (and ffprobe) were not found on this computer.\n\n"
+    "Windows: open PowerShell and run\n    winget install Gyan.FFmpeg\n"
+    "then close and reopen PowerShell and this app so PATH refreshes.\n\n"
+    "macOS: brew install ffmpeg\nLinux: sudo apt install ffmpeg"
+)
+
+# Palette: graphite panels, one periwinkle accent.
+BG = "#16181d"
+PANEL = "#1f2229"
+RAISED = "#272b34"
+LINE = "#343945"
+TEXT = "#e8e6e1"
+SOFT = "#c3c7d1"
+MUTED = "#8d93a0"
+ACCENT = "#8b9bff"
+ACCENT_HOVER = "#7686f0"
+ACCENT_TEXT = "#10131c"
+GOOD = "#5fc9a0"
+BAD = "#ef6a6a"
+WARN = "#e8b04a"
+
+UI_FONT = "Segoe UI" if os.name == "nt" else None
+MONO_FONT = "Consolas" if os.name == "nt" else "Courier"
+
+
+class Config:
+    api_key = ""
+    model = DEFAULT_MODEL
+    cookies_browser = "None"
+
+    @classmethod
+    def load(cls):
+        load_dotenv(ENV_FILE, override=True)
+        cls.api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        cls.model = os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_MODEL
+        cls.cookies_browser = os.getenv("COOKIES_BROWSER", "None").strip() or "None"
+
+
+Config.load()
+
+
+def save_env_values(values):
+    """Update/insert KEY=VALUE lines in .env without touching other lines."""
+    lines = []
+    if ENV_FILE.exists():
+        lines = ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    remaining = dict(values)
+    out = []
+    for line in lines:
+        match = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        if match and match.group(1) in remaining:
+            key = match.group(1)
+            out.append(f"{key}={remaining.pop(key)}")
+        else:
+            out.append(line)
+    for key, value in remaining.items():
+        out.append(f"{key}={value}")
+    ENV_FILE.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# Errors and helpers
+# --------------------------------------------------------------------------- #
+class JobCancelled(Exception):
+    pass
+
+
+class UserFacingError(Exception):
+    """An error whose message is already written for the user."""
+
+
+class Waiter:
+    """Lets the worker thread wait for an answer from the UI thread."""
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.value = None
+
+    def resolve(self, value):
+        self.value = value
+        self.event.set()
+
+
+@dataclass
+class Clip:
+    rank: int
+    title: str
+    description: str
+    start: float
+    end: float
+
+    @property
+    def length(self):
+        return self.end - self.start
+
+    def to_json(self):
+        return {
+            "rank": self.rank,
+            "start_time": format_timestamp(self.start),
+            "end_time": format_timestamp(self.end),
+            "start_seconds": round(self.start, 2),
+            "end_seconds": round(self.end, 2),
+            "duration_seconds": round(self.length, 2),
+            "title": self.title,
+            "description": self.description,
+        }
+
+
+@dataclass
+class Job:
+    url: str
+    quality: str
+    ratio: object
+    duration_range: tuple
+    instructions: str
+    auto_create: bool
+    cancel: threading.Event
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def friendly_error(exc):
+    """Turn technical exceptions into messages that say what to do next."""
+    if isinstance(exc, UserFacingError):
+        return str(exc)
+    raw = ANSI_RE.sub("", str(exc)).strip()
+    low = raw.lower()
+    rules = [
+        (("private video",),
+         "This video is private. Use a public or unlisted video."),
+        (("confirm your age", "age-restricted", "age restricted"),
+         "This video is age-restricted. Open Settings, pick the browser where you are signed in to "
+         "YouTube under 'Browser cookies', and try again."),
+        (("not a bot", "sign in to confirm"),
+         "YouTube asked for a sign-in check. Open Settings, pick the browser where you are signed in "
+         "to YouTube under 'Browser cookies', and try again."),
+        (("members-only", "members only", "join this channel"),
+         "This video is for channel members only. Pick a public video, or use browser cookies from "
+         "an account that is a member (Settings)."),
+        (("not available in your country", "blocked it in your country", "geo restricted", "geo-restricted"),
+         "This video is blocked in your country."),
+        (("video unavailable", "this video is unavailable", "has been removed", "no longer available",
+          "this video has been"),
+         "This video is unavailable or was removed."),
+        (("premieres in", "live event will begin"),
+         "This is an upcoming premiere/live stream. Try again after it has finished."),
+        (("unsupported url", "is not a valid url"),
+         "That link is not supported. Paste a normal YouTube video link."),
+        (("http error 429", "too many requests"),
+         "YouTube is rate limiting this computer. Wait a few minutes, or use browser cookies in Settings."),
+        (("getaddrinfo", "urlopen error", "timed out", "timeout", "connection reset", "connection aborted",
+          "network is unreachable", "name or service not known", "failed to resolve", "temporary failure",
+          "connection error", "max retries exceeded"),
+         "Network problem. Check your internet connection and try again."),
+        (("no space left", "disk full"),
+         "The disk is full. Free some space and try again."),
+        (("permission denied", "access is denied"),
+         "Windows blocked access to a file or folder. Close any program using the clips and try again."),
+        (("api key not valid", "api_key_invalid", "invalid api key", "api key expired"),
+         "The Gemini API key is not valid. Check it in Settings."),
+        (("permission_denied", "403"),
+         "Gemini refused the request (permission denied). Check the API key and model in Settings."),
+        (("resource_exhausted", "quota", "429"),
+         "The Gemini quota or rate limit was reached."),
+        (("not_found", "404", "is not found for api version", "models/"),
+         f"Gemini could not find the model '{Config.model}'. Check the model name in Settings."),
+        (("503", "unavailable", "overloaded"),
+         "Gemini is overloaded right now."),
+    ]
+    for needles, message in rules:
+        if any(n in low for n in needles):
+            return message
+    if len(raw) > 500:
+        raw = raw[:500] + "…"
+    return raw or exc.__class__.__name__
+
+
+def is_fatal_ai_error(exc):
+    """Errors that retrying cannot fix (wrong key, wrong model)."""
+    low = str(exc).lower()
+    return any(n in low for n in (
+        "api key not valid", "api_key_invalid", "invalid api key", "permission_denied",
+        "is not found for api version", "not_found", "api key expired",
+    ))
+
 
 def safe_name(value, max_length=100):
     value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", str(value))
     value = re.sub(r"\s+", " ", value).strip(" .")
-    return (value[:max_length].strip() or "youtube_video")
+    return value[:max_length].strip(" .") or "youtube_video"
 
 
-def locate_download(info, ydl):
-    candidates = []
-    for key in ("filepath", "_filename"):
-        if info.get(key):
-            candidates.append(Path(info[key]))
-
-    try:
-        prepared = Path(ydl.prepare_filename(info))
-        candidates.extend([
-            prepared,
-            prepared.with_suffix(".mp4"),
-            prepared.with_suffix(".mkv"),
-            prepared.with_suffix(".webm"),
-        ])
-    except Exception:
-        pass
-
-    for item in info.get("requested_downloads", []):
-        if item.get("filepath"):
-            candidates.append(Path(item["filepath"]))
-
-    seen = set()
-    for path in candidates:
-        try:
-            path = path.resolve()
-        except OSError:
-            continue
-        if path not in seen:
-            seen.add(path)
-            if path.is_file() and path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}:
-                return path
-
-    files = [
-        p for p in DOWNLOAD_DIR.iterdir()
-        if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}
-        and not p.name.endswith((".part", ".ytdl"))
-    ]
-    if files:
-        return max(files, key=lambda p: p.stat().st_mtime)
-    raise FileNotFoundError("Could not locate the downloaded merged video.")
-
-
-def get_duration(path):
-    result = subprocess.run(
-        [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ],
-        capture_output=True, text=True, check=True
-    )
-    return float(result.stdout.strip())
-
-
-def parse_timestamped_subtitles(path):
-    """Read VTT/SRT captions and return timestamped lines for Gemini."""
-    content = path.read_text(encoding="utf-8-sig", errors="replace")
-    lines = content.splitlines()
-    entries = []
-    i = 0
-    timestamp_pattern = re.compile(
-        r"(?P<start>\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?)\s*-->\s*"
-    )
-
-    def to_seconds(value):
-        value = value.replace(",", ".")
-        parts = value.split(":")
-        if len(parts) == 2:
-            hours = 0
-            minutes = int(parts[0])
-            seconds = float(parts[1])
-        else:
-            hours = int(parts[0])
-            minutes = int(parts[1])
-            seconds = float(parts[2])
-        return hours * 3600 + minutes * 60 + seconds
-
-    while i < len(lines):
-        line = lines[i].strip()
-        match = timestamp_pattern.search(line)
-        if match:
-            start_text = match.group("start")
-            cue_text = []
-            i += 1
-            while i < len(lines) and lines[i].strip():
-                candidate = lines[i].strip()
-                if not candidate.startswith(("NOTE", "STYLE", "REGION")):
-                    candidate = re.sub(r"<[^>]+>", "", candidate)
-                    candidate = re.sub(r"&amp;", "&", candidate)
-                    candidate = re.sub(r"&lt;", "<", candidate)
-                    candidate = re.sub(r"&gt;", ">", candidate)
-                    if candidate and not candidate.isdigit():
-                        cue_text.append(candidate)
-                i += 1
-            text = " ".join(cue_text).strip()
-            if text:
-                seconds = to_seconds(start_text)
-                timestamp = format_timestamp(seconds)
-                entries.append(f"[{timestamp}] {text}")
-        i += 1
-
-    if not entries:
-        # Support plain TXT transcripts if each line begins with a timestamp.
-        for line in lines:
-            line = line.strip()
-            if re.match(r"^\[?\d{1,2}:\d{2}(?::\d{2})?\]?\s+.+", line):
-                entries.append(line)
-
-    if not entries:
-        raise ValueError(
-            "The transcript has no readable timestamps. Please upload a timestamped "
-            "VTT/SRT transcript, or a TXT file with timestamps on each line."
-        )
-
-    return "\n".join(entries)
+def unique_path(path):
+    if not path.exists():
+        return path
+    for n in range(2, 1000):
+        candidate = path.with_name(f"{path.stem}_{n}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    return path
 
 
 def format_timestamp(seconds):
     seconds = max(0, int(seconds))
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
     if hours:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
 
 
-def download_video(url, quality, log, status, progress):
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-    def hook(info):
-        if info.get("status") == "downloading":
-            total = info.get("total_bytes") or info.get("total_bytes_estimate")
-            downloaded = info.get("downloaded_bytes", 0)
-            if total:
-                pct = min(35, downloaded / total * 35)
-                progress(pct)
-                status(f"Downloading video... {downloaded / total * 100:.1f}%")
-        elif info.get("status") == "finished":
-            log("Video/audio streams downloaded; FFmpeg is merging them.")
-
-    options = {
-        "format": quality,
-        "merge_output_format": "mp4",
-        "outtmpl": str(DOWNLOAD_DIR / "%(title).150B_%(id)s.%(ext)s"),
-        "noplaylist": True,
-        "retries": 3,
-        "progress_hooks": [hook],
-    }
-
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
-        path = locate_download(info, ydl)
-    return path, info
+_NUM = re.compile(r"\d+(?:\.\d+)?")
 
 
-def download_transcript(url, video_info, log):
-    """Try official subtitles first, then YouTube auto captions."""
-    subtitles = video_info.get("subtitles") or {}
-    auto_captions = video_info.get("automatic_captions") or {}
-
-    available = list(subtitles.keys()) + [
-        key for key in auto_captions.keys() if key not in subtitles
-    ]
-    if not available:
-        return None
-
-    preferred = []
-    for wanted in ("en", "en-US", "en-GB", "hi", "hi-IN", "en-orig", "hi-orig"):
-        if wanted in available and wanted not in preferred:
-            preferred.append(wanted)
-
-    # If no preferred language exists, try the first available caption language.
-    if not preferred:
-        preferred = [available[0]]
-
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    for language in preferred:
-        options = {
-            "skip_download": True,
-            "writesubtitles": True,
-            "writeautomaticsub": True,
-            "subtitleslangs": [language],
-            "subtitlesformat": "vtt/best",
-            "outtmpl": str(DOWNLOAD_DIR / "%(title).150B_%(id)s.%(ext)s"),
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "ignoreerrors": True,
-        }
-        try:
-            with yt_dlp.YoutubeDL(options) as ydl:
-                ydl.download([url])
-            video_id = video_info.get("id", "")
-            candidates = sorted(
-                DOWNLOAD_DIR.glob(f"*{video_id}*.vtt"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True
-            )
-            if candidates:
-                log(f"Transcript downloaded automatically ({language}).")
-                return candidates[0]
-        except Exception as exc:
-            log(f"Caption attempt for {language} did not work: {exc}")
-
-    return None
+def parse_time_value(value):
+    """Accepts 12, 12.5, '12', '01:05', '1:02:03.500', '01:05,250' -> seconds."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError("empty time value")
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", ".")
+    if _NUM.fullmatch(text):
+        return float(text)
+    parts = text.split(":")
+    if len(parts) in (2, 3) and all(_NUM.fullmatch(p) for p in parts):
+        nums = [float(p) for p in parts]
+        if len(nums) == 2:
+            return nums[0] * 60 + nums[1]
+        return nums[0] * 3600 + nums[1] * 60 + nums[2]
+    raise ValueError(f"cannot read time '{value}'")
 
 
-def generate_top_clips_with_gemini(transcript_text, video_title, source_url, duration, clip_duration_range, user_instructions):
-    if not GEMINI_API_KEY:
-        raise RuntimeError(
-            "GEMINI_API_KEY is missing. Add GEMINI_API_KEY and GEMINI_MODEL to the .env file."
+def read_text_file(path):
+    data = Path(path).read_bytes()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("cp1252", errors="replace")
+
+
+def open_path(path, select=False):
+    path = Path(path)
+    try:
+        if os.name == "nt":
+            if select and path.is_file():
+                subprocess.Popen(["explorer", "/select,", str(path)])
+            else:
+                os.startfile(str(path if path.is_dir() else path.parent if select else path))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(path)] if (select and path.is_file()) else ["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path if path.is_dir() else path.parent)])
+    except Exception as exc:
+        messagebox.showerror("Cannot open", str(exc))
+
+
+# --------------------------------------------------------------------------- #
+# Transcript parsing
+# --------------------------------------------------------------------------- #
+CUE_RE = re.compile(r"(?P<start>(?:\d{1,2}:)?\d{1,2}:\d{2}(?:[.,]\d{1,3})?)\s*-->")
+TS_ONLY_RE = re.compile(r"^\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?$")
+TS_INLINE_RE = re.compile(r"^\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?\s*[-–—:]?\s+(.+)$")
+
+
+def clean_caption_line(line):
+    line = re.sub(r"<[^>]+>", "", line)
+    line = line.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    line = line.replace("&nbsp;", " ").replace("&#39;", "'").replace("&quot;", '"')
+    return re.sub(r"\s+", " ", line).strip()
+
+
+def parse_transcript_text(content):
+    """VTT / SRT / '[mm:ss] text' / YouTube 'Show transcript' paste -> '[mm:ss] text' lines."""
+    lines = content.splitlines()
+    entries = []
+
+    # 1) VTT / SRT cues (with de-duplication of YouTube's rolling captions)
+    prev_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        match = CUE_RE.search(line) if "-->" in line else None
+        if match:
+            try:
+                start = parse_time_value(match.group("start"))
+            except ValueError:
+                i += 1
+                continue
+            i += 1
+            cue_lines = []
+            while i < len(lines) and lines[i].strip():
+                cleaned = clean_caption_line(lines[i])
+                if cleaned:
+                    cue_lines.append(cleaned)
+                i += 1
+            fresh = [c for c in cue_lines if c not in prev_lines]
+            if cue_lines:
+                prev_lines = cue_lines
+            text = " ".join(fresh).strip()
+            if text:
+                entries.append(f"[{format_timestamp(start)}] {text}")
+        i += 1
+
+    # 2) Plain text: '[01:23] text', '01:23 text', or timestamp on its own line
+    if not entries:
+        current_start = None
+        buffer = []
+
+        def flush():
+            nonlocal buffer
+            if current_start is not None and buffer:
+                entries.append(f"[{format_timestamp(current_start)}] {' '.join(buffer)}")
+            buffer = []
+
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            only = TS_ONLY_RE.match(line)
+            if only:
+                flush()
+                current_start = parse_time_value(only.group(1))
+                continue
+            inline = TS_INLINE_RE.match(line)
+            if inline:
+                flush()
+                current_start = None
+                entries.append(f"[{format_timestamp(parse_time_value(inline.group(1)))}] {inline.group(2).strip()}")
+                continue
+            if current_start is not None:
+                buffer.append(line)
+        flush()
+
+    if not entries:
+        if not content.strip():
+            raise ValueError("The transcript is empty.")
+        raise ValueError(
+            "No timestamps were found in this transcript. Use a VTT or SRT file, or text where each "
+            "line starts with a time like [01:23] or 01:23."
         )
+    return "\n".join(entries)
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
 
-    prompt = f"""
-You are an expert short-form video editor. Analyze the timestamped transcript below
-and identify the five strongest short-form viral moments for Instagram Reels and
-YouTube Shorts.
+# --------------------------------------------------------------------------- #
+# Prompt, AI JSON parsing and validation
+# --------------------------------------------------------------------------- #
+def build_prompt(video_title, source_url, duration, rng, instructions,
+                 transcript_text=None, feedback=None):
+    duration_text = f"{duration:.2f}" if duration else "unknown (do not go past the end of the transcript)"
+    if transcript_text is None:
+        transcript_block = (
+            "The timestamped transcript is attached to this message as the file transcript.txt. "
+            "Read the whole file before answering."
+        )
+    else:
+        transcript_block = f"TIMESTAMPED TRANSCRIPT:\n{transcript_text}"
+    correction = ""
+    if feedback:
+        correction = (
+            "\nIMPORTANT CORRECTION: your previous answer was rejected because: "
+            f"{feedback}\nFix this in your new answer.\n"
+        )
+    title_json = json.dumps(video_title, ensure_ascii=False)
+    url_json = json.dumps(source_url, ensure_ascii=False)
+    return f"""You are an expert short-form video editor. Analyze the timestamped transcript
+and identify the five strongest short-form viral moments for Instagram Reels and YouTube Shorts.
 
 VIDEO TITLE: {video_title}
 SOURCE URL: {source_url}
-FULL VIDEO DURATION IN SECONDS: {duration:.2f}
-REQUIRED CLIP DURATION: {clip_duration_range[0]} to {clip_duration_range[1]} seconds per clip.
-ADDITIONAL USER INSTRUCTIONS: {user_instructions or "None. Use your best editorial judgment."}
-
+FULL VIDEO DURATION IN SECONDS: {duration_text}
+REQUIRED CLIP DURATION: {rng[0]} to {rng[1]} seconds per clip.
+ADDITIONAL USER INSTRUCTIONS: {instructions or "None. Use your best editorial judgment."}
+{correction}
 Requirements:
 - Return exactly 5 distinct moments, ranked from strongest to fifth strongest.
-- Every clip MUST be between {clip_duration_range[0]} and {clip_duration_range[1]} seconds inclusive.
+- Every clip MUST be between {rng[0]} and {rng[1]} seconds inclusive.
 - Prioritize the requested duration range over other editorial preferences.
 - Choose self-contained moments with a clear hook, funny/emotional/surprising payoff,
   useful insight, or strong audience reaction.
@@ -303,8 +494,8 @@ Requirements:
 - Use exactly this JSON structure and field names:
 
 {{
-  "video_title": "{video_title}",
-  "source_url": "{source_url}",
+  "video_title": {title_json},
+  "source_url": {url_json},
   "top_5_viral_clips": [
     {{
       "rank": 1,
@@ -319,243 +510,944 @@ Requirements:
   ]
 }}
 
-TIMESTAMPED TRANSCRIPT:
-{transcript_text}
+{transcript_block}
 """
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.25,
-        ),
-    )
 
-    text = (response.text or "").strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
+def _pull_clip_list(obj):
+    if isinstance(obj, list) and obj and all(isinstance(x, dict) for x in obj):
+        return obj
+    if isinstance(obj, dict):
+        value = obj.get("top_5_viral_clips")
+        if isinstance(value, list):
+            return value
+        for value in obj.values():
+            if isinstance(value, list) and value and all(isinstance(x, dict) for x in value):
+                return value
+    return None
+
+
+def extract_raw_clips(text):
+    """Find the clip list inside whatever Gemini returned (fences, chatter, list/dict)."""
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("The response is empty.")
+    text = re.sub(r"^```(?:json|JSON)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
 
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Gemini returned invalid JSON: {exc}") from exc
+    variants = [text]
+    straight = text.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+    if straight != text:
+        variants.append(straight)
 
-    if not isinstance(data, dict) or not isinstance(data.get("top_5_viral_clips"), list):
-        raise ValueError('Gemini response did not contain "top_5_viral_clips".')
-
-    if len(data["top_5_viral_clips"]) != 5:
-        raise ValueError(
-            f"Gemini returned {len(data['top_5_viral_clips'])} clips instead of 5. "
-            "Try again or check the transcript."
-        )
-
-    return data
-
-
-def validate_clips(clips, video_duration, clip_duration_range):
-    valid = []
-    for index, clip in enumerate(clips, 1):
-        if not isinstance(clip, dict):
-            raise ValueError(f"Clip #{index} is not a JSON object.")
+    decoder = json.JSONDecoder()
+    last_error = None
+    for variant in variants:
         try:
-            start = float(clip["start_seconds"])
-            end = float(clip["end_seconds"])
-        except (KeyError, TypeError, ValueError):
-            raise ValueError(f"Clip #{index} has invalid start_seconds/end_seconds.")
+            clips = _pull_clip_list(json.loads(variant))
+            if clips is not None:
+                return clips
+        except json.JSONDecodeError as exc:
+            last_error = exc
+        for index, ch in enumerate(variant):
+            if ch in "{[":
+                try:
+                    obj, _ = decoder.raw_decode(variant[index:])
+                except json.JSONDecodeError as exc:
+                    last_error = exc
+                    continue
+                clips = _pull_clip_list(obj)
+                if clips is not None:
+                    return clips
+    if last_error:
+        raise ValueError(f"The text is not valid JSON ({last_error.msg} at position {last_error.pos}).")
+    raise ValueError('No clip list was found. The JSON must contain "top_5_viral_clips".')
+
+
+def _first_value(raw, *keys):
+    for key in keys:
+        value = raw.get(key)
+        if value is not None and value != "":
+            return value
+    raise KeyError(keys[0])
+
+
+def build_clips(raw_clips, video_duration, rng, tolerance=CLIP_TOLERANCE):
+    """Validate/repair clips. Returns (valid_clips, problems)."""
+    clips, problems = [], []
+    min_len, max_len = rng
+    for index, raw in enumerate(raw_clips, 1):
+        label = f"Clip {index}"
+        try:
+            start = parse_time_value(_first_value(raw, "start_seconds", "start_time", "start"))
+            try:
+                end = parse_time_value(_first_value(raw, "end_seconds", "end_time", "end"))
+            except KeyError:
+                end = start + parse_time_value(_first_value(raw, "duration_seconds", "duration"))
+        except (KeyError, ValueError):
+            problems.append(f"{label} has no readable start/end time.")
+            continue
         if start < 0 or end <= start:
-            raise ValueError(f"Clip #{index} has an invalid time range.")
-        if end > video_duration:
-            raise ValueError(
-                f"Clip #{index} ends at {end:.1f}s, beyond the video duration "
-                f"({video_duration:.1f}s)."
-            )
-        clip_length = end - start
-        min_length, max_length = clip_duration_range
-        if clip_length < min_length or clip_length > max_length:
-            raise ValueError(
-                f"Clip #{index} is {clip_length:.1f}s long, outside the selected "
-                f"{min_length}–{max_length}s range. Try again or choose a wider range."
-            )
-        valid.append((clip, start, end))
-    return valid
+            problems.append(f"{label} has an invalid time range ({start:.1f}s to {end:.1f}s).")
+            continue
+        if video_duration:
+            if start >= video_duration:
+                problems.append(f"{label} starts at {start:.1f}s, after the video ends ({video_duration:.1f}s).")
+                continue
+            if end > video_duration:
+                if end - video_duration > 3:
+                    problems.append(f"{label} ends at {end:.1f}s, beyond the video length ({video_duration:.1f}s).")
+                    continue
+                end = video_duration
+        length = end - start
+        if length < min_len - tolerance or length > max_len + tolerance:
+            problems.append(f"{label} is {length:.1f}s long, outside the {min_len}-{max_len}s range.")
+            continue
+        try:
+            rank = int(raw.get("rank", index))
+        except (TypeError, ValueError):
+            rank = index
+        title = str(raw.get("title") or f"Clip {rank}").strip()
+        description = str(raw.get("description") or "").strip()
+        clips.append(Clip(rank, title, description, start, end))
+
+    clips.sort(key=lambda c: c.rank)
+    clips = clips[:REQUIRED_CLIPS]
+    for new_rank, clip in enumerate(clips, 1):
+        clip.rank = new_rank
+    if len(raw_clips) < REQUIRED_CLIPS:
+        problems.append(f"Only {len(raw_clips)} clips were returned; exactly {REQUIRED_CLIPS} are needed.")
+    return clips, problems
+
+
+def fit_to_duration(clips, duration):
+    """After download we know the true duration: clamp or drop clips beyond it."""
+    kept, dropped = [], []
+    for clip in clips:
+        if clip.start >= duration - 1:
+            dropped.append(clip)
+            continue
+        end = min(clip.end, duration)
+        if end - clip.start < 1:
+            dropped.append(clip)
+            continue
+        kept.append(Clip(clip.rank, clip.title, clip.description, clip.start, end))
+    return kept, dropped
+
+
+# --------------------------------------------------------------------------- #
+# yt-dlp / ffmpeg / Gemini
+# --------------------------------------------------------------------------- #
+def ydl_base_options():
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "retries": 3,
+        "socket_timeout": 30,
+    }
+    cookies_file = BASE_DIR / "cookies.txt"
+    if cookies_file.is_file():
+        options["cookiefile"] = str(cookies_file)
+    else:
+        browser = Config.cookies_browser.strip().lower()
+        if browser and browser != "none":
+            options["cookiesfrombrowser"] = (browser,)
+    return options
+
+
+def fetch_video_info(url):
+    options = ydl_base_options()
+    options["skip_download"] = True
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not info:
+        raise UserFacingError("Could not read any information from this link.")
+    if info.get("_type") == "playlist":
+        entries = [e for e in (info.get("entries") or []) if e]
+        if not entries:
+            raise UserFacingError("This link is an empty playlist. Paste a single video link.")
+        info = entries[0]
+    return info
+
+
+def locate_download(info, ydl):
+    candidates = []
+    for item in info.get("requested_downloads", []) or []:
+        if item.get("filepath"):
+            candidates.append(Path(item["filepath"]))
+    for key in ("filepath", "_filename"):
+        if info.get(key):
+            candidates.append(Path(info[key]))
+    try:
+        prepared = Path(ydl.prepare_filename(info))
+        candidates.extend([prepared] + [prepared.with_suffix(s) for s in (".mp4", ".mkv", ".webm")])
+    except Exception:
+        pass
+
+    video_exts = {".mp4", ".mkv", ".webm", ".mov"}
+    seen = set()
+    for path in candidates:
+        try:
+            path = path.resolve()
+        except OSError:
+            continue
+        if path not in seen:
+            seen.add(path)
+            if path.is_file() and path.suffix.lower() in video_exts:
+                return path
+
+    video_id = info.get("id", "")
+    files = [
+        p for p in DOWNLOAD_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in video_exts and not p.name.endswith((".part", ".ytdl"))
+    ]
+    by_id = [p for p in files if video_id and video_id in p.name]
+    pool = by_id or files
+    if pool:
+        return max(pool, key=lambda p: p.stat().st_mtime)
+    raise FileNotFoundError("Could not find the downloaded video file.")
+
+
+def download_video(url, quality, log, status, progress, cancel):
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    top = {"value": 30.0}
+
+    def hook(data):
+        if cancel.is_set():
+            raise JobCancelled()
+        if data.get("status") == "downloading":
+            total = data.get("total_bytes") or data.get("total_bytes_estimate")
+            done = data.get("downloaded_bytes", 0)
+            if total:
+                top["value"] = max(top["value"], 30 + min(done / total, 1) * 40)
+                progress(top["value"])
+                speed = (data.get("_speed_str") or "").strip()
+                eta = (data.get("_eta_str") or "").strip()
+                extra = f"  •  {speed}" if speed else ""
+                extra += f"  •  ETA {eta}" if eta else ""
+                status(f"Downloading video… {done / total * 100:.0f}%{extra}")
+        elif data.get("status") == "finished":
+            log("Video and audio downloaded. FFmpeg is merging them.")
+            status("Merging video and audio…")
+
+    options = ydl_base_options()
+    options.update({
+        "format": quality,
+        "merge_output_format": "mp4",
+        "outtmpl": str(DOWNLOAD_DIR / "%(title).150B_%(id)s.%(ext)s"),
+        "progress_hooks": [hook],
+    })
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=True)
+            path = locate_download(info, ydl)
+    except JobCancelled:
+        raise
+    except Exception:
+        if cancel.is_set():
+            raise JobCancelled()
+        raise
+    return path, info
+
+
+def pick_caption_languages(info):
+    subs = [k for k in (info.get("subtitles") or {}).keys() if k != "live_chat"]
+    autos = list((info.get("automatic_captions") or {}).keys())
+    pool = subs + [a for a in autos if a not in subs]
+    ordered = []
+    for wanted in ("en", "en-US", "en-GB", "en-orig", "hi", "hi-IN", "hi-orig"):
+        if wanted in pool and wanted not in ordered:
+            ordered.append(wanted)
+    for key in subs:
+        if key not in ordered:
+            ordered.append(key)
+    for key in autos:  # '-orig' means the video's own spoken language, not a translation
+        if key.endswith("-orig") and key not in ordered:
+            ordered.append(key)
+    return ordered[:4]
+
+
+def download_transcript(url, info, log, cancel):
+    """Try official subtitles, then YouTube auto captions. Returns a Path or None."""
+    languages = pick_caption_languages(info)
+    if not languages:
+        log("This video has no published captions.", "warn")
+        return None
+    video_id = info.get("id", "")
+    if not video_id:
+        return None
+
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    for language in languages:
+        if cancel.is_set():
+            raise JobCancelled()
+        options = ydl_base_options()
+        options.update({
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": [language],
+            "subtitlesformat": "vtt/best",
+            "outtmpl": str(DOWNLOAD_DIR / "%(title).150B_%(id)s.%(ext)s"),
+            "ignoreerrors": True,
+        })
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                ydl.download([url])
+        except Exception as exc:
+            log(f"Captions ({language}) failed: {friendly_error(exc)}", "warn")
+            continue
+        found = sorted(
+            list(DOWNLOAD_DIR.glob(f"*{video_id}*.{language}.vtt")) +
+            list(DOWNLOAD_DIR.glob(f"*{video_id}*.{language}.srt")),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        if found:
+            log(f"Captions downloaded ({language}).")
+            return found[0]
+    return None
+
+
+def probe_duration(path, cancel=None):
+    code, out, err = run_process(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        cancel=cancel, timeout=60,
+    )
+    if code != 0:
+        raise RuntimeError(f"ffprobe failed: {(err or '').strip().splitlines()[-1:] or 'unknown error'}")
+    return float(out.strip())
+
+
+def run_process(cmd, cancel=None, timeout=None):
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
+    )
+    started = time.time()
+    while True:
+        try:
+            out, err = proc.communicate(timeout=0.4)
+            return proc.returncode, out, err
+        except subprocess.TimeoutExpired:
+            if cancel is not None and cancel.is_set():
+                proc.kill()
+                proc.communicate()
+                raise JobCancelled()
+            if timeout and time.time() - started > timeout:
+                proc.kill()
+                proc.communicate()
+                raise RuntimeError("A tool took too long and was stopped.")
 
 
 def make_video_filter(output_size):
     if output_size is None:
         return None
     width, height = output_size
-    return (
-        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},setsar=1"
-    )
+    return f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1"
 
 
-def cut_clip(source_path, output_path, start, end, output_size):
+def cut_clip(source_path, output_path, start, end, output_size, cancel):
     command = [
-        "ffmpeg", "-hide_banner", "-y",
-        "-ss", f"{start:.3f}",
-        "-i", str(source_path),
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", f"{start:.3f}", "-i", str(source_path),
         "-t", f"{end - start:.3f}",
-        "-map", "0:v:0",
-        "-map", "0:a:0?",
+        "-map", "0:v:0", "-map", "0:a:0?",
     ]
-
     video_filter = make_video_filter(output_size)
     if video_filter:
         command.extend(["-vf", video_filter])
-
     command.extend([
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "20",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-movflags", "+faststart",
-        str(output_path),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output_path),
     ])
-    subprocess.run(command, capture_output=True, text=True, check=True)
+    code, _, err = run_process(command, cancel=cancel, timeout=1800)
+    if code != 0:
+        lines = (err or "").strip().splitlines()
+        raise RuntimeError(lines[-1] if lines else "FFmpeg failed")
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError("FFmpeg produced an empty file")
 
 
-class ViralClipsApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("YouTube Viral Clips Generator")
-        self.root.geometry("960x900")
-        self.root.minsize(820, 760)
+def call_gemini(prompt):
+    client = genai.Client(api_key=Config.api_key, http_options=types.HttpOptions(timeout=180_000))
+    response = client.models.generate_content(
+        model=Config.model,
+        contents=prompt,
+        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.25),
+    )
+    try:
+        text = (response.text or "").strip()
+    except Exception:
+        text = ""
+    if not text:
+        raise ValueError("Gemini returned an empty answer (it may have been blocked).")
+    return text
+
+
+# --------------------------------------------------------------------------- #
+# UI building blocks
+# --------------------------------------------------------------------------- #
+def font(size=13, weight="normal", mono=False):
+    family = MONO_FONT if mono else UI_FONT
+    return ctk.CTkFont(family=family, size=size, weight=weight)
+
+
+def set_textbox(box, text):
+    box.configure(state="normal")
+    box.delete("1.0", "end")
+    box.insert("1.0", text)
+    box.configure(state="disabled")
+
+
+def primary_button(parent, text, command, **kw):
+    return ctk.CTkButton(
+        parent, text=text, command=command, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+        text_color=ACCENT_TEXT, font=font(13, "bold"), height=38, corner_radius=8, **kw)
+
+
+def quiet_button(parent, text, command, **kw):
+    kw.setdefault("height", 34)
+    return ctk.CTkButton(
+        parent, text=text, command=command, fg_color=RAISED, hover_color=LINE,
+        text_color=TEXT, font=font(13), corner_radius=8, border_width=1, border_color=LINE, **kw)
+
+
+def option_menu(parent, values, variable):
+    return ctk.CTkOptionMenu(
+        parent, values=values, variable=variable, dynamic_resizing=False, height=34,
+        fg_color=RAISED, button_color=LINE, button_hover_color=MUTED,
+        text_color=TEXT, dropdown_fg_color=RAISED, dropdown_hover_color=LINE,
+        dropdown_text_color=TEXT, font=font(13), dropdown_font=font(13), corner_radius=8)
+
+
+def field_label(parent, text):
+    return ctk.CTkLabel(parent, text=text, anchor="w", text_color=SOFT, font=font(12))
+
+
+class ModalBase(ctk.CTkToplevel):
+    def __init__(self, parent, title, width, height, on_done, resizable=False):
+        super().__init__(parent)
+        self._on_done = on_done
+        self._closed = False
+        self.title(title)
+        self.configure(fg_color=BG)
+        self.resizable(resizable, resizable)
+        self.minsize(min(width, 560), min(height, 420))
+        parent.update_idletasks()
+        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - width) // 2)
+        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - height) // 3)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", lambda: self.close(None))
+        self.after(200, self._take_focus)
+
+    def _take_focus(self):
+        if self._closed:
+            return
+        try:
+            self.lift()
+            self.focus_force()
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def close(self, value=None):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+        if self._on_done:
+            self._on_done(value)
+
+    def copy_to_clipboard(self, text, button=None, label="Copy"):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()
+        if button is not None:
+            button.configure(text="Copied")
+            self.after(1500, lambda: button.winfo_exists() and button.configure(text=label))
+
+
+class TranscriptDialog(ModalBase):
+    """Asks for a transcript file or pasted transcript text."""
+
+    def __init__(self, parent, reason, error, on_done):
+        super().__init__(parent, "Transcript needed", 640, 600, on_done)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(4, weight=1)
+
+        ctk.CTkLabel(self, text="Add a transcript", font=font(20, "bold"), text_color=TEXT,
+                     anchor="w").grid(row=0, column=0, sticky="ew", padx=24, pady=(22, 4))
+        ctk.CTkLabel(self, text=reason, wraplength=580, justify="left", anchor="w",
+                     text_color=SOFT, font=font(13)).grid(row=1, column=0, sticky="ew", padx=24)
+
+        self.error_label = ctk.CTkLabel(self, text=error or "", wraplength=580, justify="left",
+                                        anchor="w", text_color=BAD, font=font(13))
+        self.error_label.grid(row=2, column=0, sticky="ew", padx=24, pady=(8, 0))
+
+        file_row = ctk.CTkFrame(self, fg_color="transparent")
+        file_row.grid(row=3, column=0, sticky="ew", padx=24, pady=(14, 6))
+        primary_button(file_row, "Choose a transcript file", self.choose_file).pack(side="left")
+        ctk.CTkLabel(file_row, text="VTT, SRT or TXT with timestamps", text_color=MUTED,
+                     font=font(12)).pack(side="left", padx=12)
+
+        paste_frame = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=10)
+        paste_frame.grid(row=4, column=0, sticky="nsew", padx=24, pady=(8, 8))
+        paste_frame.grid_columnconfigure(0, weight=1)
+        paste_frame.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(
+            paste_frame, anchor="w", justify="left", text_color=SOFT, font=font(12), wraplength=560,
+            text="Or paste the text. On YouTube: open the video, click ...more, then Show transcript, "
+                 "select all the lines and copy.",
+        ).grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+        self.paste_box = ctk.CTkTextbox(paste_frame, fg_color=BG, text_color=TEXT, font=font(12, mono=True),
+                                        border_width=1, border_color=LINE, wrap="word")
+        self.paste_box.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 12))
+
+        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons.grid(row=5, column=0, sticky="ew", padx=24, pady=(4, 20))
+        quiet_button(buttons, "Cancel job", lambda: self.close(None)).pack(side="left")
+        primary_button(buttons, "Use pasted text", self.use_pasted).pack(side="right")
+
+    def choose_file(self):
+        selected = filedialog.askopenfilename(
+            parent=self, title="Select timestamped transcript",
+            filetypes=[("Transcript files", "*.vtt *.srt *.txt"), ("All files", "*.*")])
+        if selected:
+            self.close(("file", selected))
+
+    def use_pasted(self):
+        text = self.paste_box.get("1.0", "end").strip()
+        if not text:
+            self.error_label.configure(text="Paste the transcript text first, or choose a file.")
+            return
+        self.close(("text", text))
+
+
+class ManualGeminiDialog(ModalBase):
+    """Fallback used only when the code's Gemini call failed."""
+
+    def __init__(self, parent, reason, folder, prompt, validator, on_done):
+        super().__init__(parent, "Finish with Gemini chat", 780, 800, on_done, resizable=True)
+        self.folder = folder
+        self.prompt = prompt
+        self.validator = validator
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(3, weight=1)
+
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 0))
+        ctk.CTkLabel(head, text="The AI step failed. You can finish it by hand.",
+                     font=font(20, "bold"), text_color=TEXT, anchor="w").pack(anchor="w")
+        ctk.CTkLabel(head, text=reason, wraplength=720, justify="left", anchor="w",
+                     text_color=WARN, font=font(13)).pack(anchor="w", pady=(6, 0))
+
+        steps = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=10)
+        steps.grid(row=1, column=0, sticky="ew", padx=24, pady=(14, 8))
+        steps.grid_columnconfigure(1, weight=1)
+
+        rows = [
+            ("1", "Open Gemini in your browser and start a new chat.", "Open Gemini", self.open_gemini),
+            ("2", f"Attach the transcript file  (transcript.txt in {folder.name}).",
+             "Open folder", lambda: open_path(self.folder)),
+            ("3", "Paste the prompt into the chat and send it.", "Copy prompt", None),
+            ("4", "Copy Gemini's JSON answer and paste it in the box below.", "", None),
+        ]
+        for r, (num, text, btn_text, cmd) in enumerate(rows):
+            ctk.CTkLabel(steps, text=num, width=26, height=26, corner_radius=13, fg_color=RAISED,
+                         text_color=ACCENT, font=font(12, "bold")).grid(
+                row=r, column=0, padx=(14, 8), pady=(12 if r == 0 else 5, 12 if r == len(rows) - 1 else 5))
+            ctk.CTkLabel(steps, text=text, anchor="w", justify="left", wraplength=470, text_color=TEXT,
+                         font=font(13)).grid(row=r, column=1, sticky="ew", pady=5)
+            if btn_text:
+                button = quiet_button(steps, btn_text, cmd, width=120)
+                if btn_text == "Copy prompt":
+                    self.copy_button = button
+                    button.configure(command=lambda b=button: self.copy_to_clipboard(self.prompt, b, "Copy prompt"))
+                button.grid(row=r, column=2, padx=(8, 14), pady=5)
+
+        ctk.CTkLabel(self, text="Paste Gemini's JSON answer here", anchor="w", text_color=SOFT,
+                     font=font(12)).grid(row=2, column=0, sticky="ew", padx=26, pady=(8, 0))
+        self.json_box = ctk.CTkTextbox(self, fg_color=PANEL, text_color=TEXT, font=font(12, mono=True),
+                                       border_width=1, border_color=LINE, wrap="word")
+        self.json_box.grid(row=3, column=0, sticky="nsew", padx=24, pady=(4, 6))
+
+        self.error_label = ctk.CTkLabel(self, text="", wraplength=720, justify="left", anchor="w",
+                                        text_color=BAD, font=font(13))
+        self.error_label.grid(row=4, column=0, sticky="ew", padx=26)
+
+        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons.grid(row=5, column=0, sticky="ew", padx=24, pady=(8, 20))
+        quiet_button(buttons, "Cancel job", lambda: self.close(None)).pack(side="left")
+        quiet_button(buttons, "Paste from clipboard", self.paste_clipboard).pack(side="left", padx=8)
+        primary_button(buttons, "Use this JSON", self.submit).pack(side="right")
+
+    def open_gemini(self):
+        webbrowser.open(GEMINI_URL)
+
+    def paste_clipboard(self):
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            self.error_label.configure(text="The clipboard is empty.")
+            return
+        self.json_box.delete("1.0", "end")
+        self.json_box.insert("1.0", text)
+        self.error_label.configure(text="")
+
+    def submit(self):
+        text = self.json_box.get("1.0", "end").strip()
+        if not text:
+            self.error_label.configure(text="Paste Gemini's JSON answer first.")
+            return
+        result, error = self.validator(text, self)
+        if result is None:
+            self.error_label.configure(text=error or "That answer could not be used.")
+            return
+        self.close(result)
+
+
+class SettingsDialog(ModalBase):
+    def __init__(self, parent, on_saved):
+        super().__init__(parent, "Settings", 520, 520, None)
+        self.on_saved = on_saved
+        self.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(self, text="Settings", font=font(20, "bold"), text_color=TEXT,
+                     anchor="w").grid(row=0, column=0, sticky="ew", padx=24, pady=(22, 2))
+        ctk.CTkLabel(self, text=f"Saved to {ENV_FILE.name} next to the app.", text_color=MUTED,
+                     anchor="w", font=font(12)).grid(row=1, column=0, sticky="ew", padx=24)
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.grid(row=2, column=0, sticky="ew", padx=24, pady=14)
+        body.grid_columnconfigure(0, weight=1)
+
+        field_label(body, "Gemini API key").grid(row=0, column=0, sticky="w")
+        self.key_entry = ctk.CTkEntry(body, show="•", height=36, fg_color=PANEL, border_color=LINE,
+                                      text_color=TEXT, font=font(13))
+        self.key_entry.grid(row=1, column=0, sticky="ew", pady=(4, 2))
+        self.key_entry.insert(0, Config.api_key)
+        self.show_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(body, text="Show key", variable=self.show_var, command=self.toggle_key,
+                        text_color=SOFT, font=font(12), checkbox_width=18, checkbox_height=18,
+                        fg_color=ACCENT, hover_color=ACCENT_HOVER).grid(row=2, column=0, sticky="w", pady=(2, 12))
+
+        field_label(body, "Gemini model").grid(row=3, column=0, sticky="w")
+        self.model_entry = ctk.CTkEntry(body, height=36, fg_color=PANEL, border_color=LINE,
+                                        text_color=TEXT, font=font(13))
+        self.model_entry.grid(row=4, column=0, sticky="ew", pady=(4, 12))
+        self.model_entry.insert(0, Config.model)
+
+        field_label(body, "Browser cookies (fixes age-restricted videos and 'not a bot' errors)").grid(
+            row=5, column=0, sticky="w")
+        self.cookie_var = tk.StringVar(value=Config.cookies_browser if Config.cookies_browser in COOKIE_BROWSERS
+                                       else "None")
+        option_menu(body, COOKIE_BROWSERS, self.cookie_var).grid(row=6, column=0, sticky="ew", pady=(4, 0))
+        ctk.CTkLabel(body, text="Pick the browser where you are signed in to YouTube. Close that browser "
+                                "first if downloads fail.", wraplength=460, justify="left", anchor="w",
+                     text_color=MUTED, font=font(12)).grid(row=7, column=0, sticky="ew", pady=(6, 0))
+
+        self.message = ctk.CTkLabel(self, text="", text_color=BAD, anchor="w", font=font(12))
+        self.message.grid(row=3, column=0, sticky="ew", padx=24)
+
+        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons.grid(row=4, column=0, sticky="ew", padx=24, pady=(10, 20))
+        quiet_button(buttons, "Cancel", lambda: self.close(None)).pack(side="left")
+        primary_button(buttons, "Save settings", self.save).pack(side="right")
+
+    def toggle_key(self):
+        self.key_entry.configure(show="" if self.show_var.get() else "•")
+
+    def save(self):
+        key = self.key_entry.get().strip()
+        model = self.model_entry.get().strip() or DEFAULT_MODEL
+        if re.search(r"\s", key):
+            self.message.configure(text="The API key must not contain spaces.")
+            return
+        try:
+            save_env_values({
+                "GEMINI_API_KEY": key,
+                "GEMINI_MODEL": model,
+                "COOKIES_BROWSER": self.cookie_var.get(),
+            })
+        except OSError as exc:
+            self.message.configure(text=f"Could not write the .env file: {exc}")
+            return
+        Config.load()
+        self.on_saved()
+        self.close(True)
+
+
+class ClipCard(ctk.CTkFrame):
+    def __init__(self, parent, clip):
+        super().__init__(parent, fg_color=PANEL, corner_radius=12, border_width=1, border_color=LINE)
+        self.clip = clip
+        self.output_path = None
+        self._wrap = 0
+        self.var = tk.BooleanVar(value=True)
+        self.grid_columnconfigure(2, weight=1)
+
+        ctk.CTkCheckBox(self, text="", variable=self.var, width=24, checkbox_width=22, checkbox_height=22,
+                        fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=MUTED).grid(
+            row=0, column=0, rowspan=4, padx=(14, 4), pady=14, sticky="n")
+        ctk.CTkLabel(self, text=f"#{clip.rank}", width=40, height=28, corner_radius=8, fg_color=RAISED,
+                     text_color=ACCENT, font=font(13, "bold")).grid(
+            row=0, column=1, rowspan=2, padx=(6, 12), pady=(14, 0), sticky="n")
+
+        self.title_label = ctk.CTkLabel(self, text=clip.title, anchor="w", justify="left",
+                                        font=font(15, "bold"), text_color=TEXT, wraplength=480)
+        self.title_label.grid(row=0, column=2, sticky="ew", pady=(12, 0), padx=(0, 12))
+        ctk.CTkLabel(
+            self, anchor="w", text_color=MUTED, font=font(12),
+            text=f"{format_timestamp(clip.start)} to {format_timestamp(clip.end)}, {clip.length:.0f} seconds",
+        ).grid(row=1, column=2, sticky="ew", padx=(0, 12))
+        self.desc_label = ctk.CTkLabel(self, text=clip.description, anchor="w", justify="left",
+                                       text_color=SOFT, font=font(13), wraplength=480)
+        if clip.description:
+            self.desc_label.grid(row=2, column=2, sticky="ew", padx=(0, 12), pady=(4, 0))
+
+        self.status = ctk.CTkLabel(self, text="Waiting", anchor="w", text_color=MUTED, font=font(12))
+        self.status.grid(row=3, column=2, sticky="w", pady=(6, 12))
+        self.open_button = quiet_button(self, "Show file", self.show_file, width=90, height=28)
+        self.open_button.grid(row=3, column=3, padx=(0, 14), pady=(6, 12))
+        self.open_button.grid_remove()
+        self.bind("<Configure>", self._resize)
+
+    def _resize(self, event):
+        wrap = max(240, event.width - 150)
+        if abs(wrap - self._wrap) > 6:
+            self._wrap = wrap
+            self.title_label.configure(wraplength=wrap)
+            self.desc_label.configure(wraplength=wrap)
+
+    def set_status(self, text, color, path=None):
+        self.status.configure(text=text, text_color=color)
+        if path:
+            self.output_path = path
+            self.open_button.grid()
+
+    def show_file(self):
+        if self.output_path:
+            open_path(self.output_path, select=True)
+
+
+# --------------------------------------------------------------------------- #
+# Main application
+# --------------------------------------------------------------------------- #
+class ViralClipsApp(ctk.CTk):
+    STEP_COLORS = {
+        "pending": (RAISED, MUTED),
+        "active": (ACCENT, ACCENT_TEXT),
+        "done": ("#245b45", "#d8f5e8"),
+        "failed": ("#6d2b2b", "#ffd9d9"),
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.title("Viral Clips Studio")
+        self.geometry("1240x820")
+        self.minsize(1060, 720)
+        self.configure(fg_color=BG)
 
         self.events = queue.Queue()
-        self.is_running = False
-        self.transcript_waiter = None
-        self.transcript_result = None
+        self.app_state = "idle"  # idle | running | review | finished
+        self.job = None
+        self.cards = []
+        self.review_waiter = None
+        self.active_dialog = None
+        self.last_output_folder = None
+        self._alive = True
+        self._step_index = None
+        self._step_state = None
 
-        self.url_var = tk.StringVar()
         self.quality_var = tk.StringVar(value="720p or lower")
         self.ratio_var = tk.StringVar(value="Vertical 9:16 (Reels / Shorts)")
         self.duration_var = tk.StringVar(value="20–25 seconds")
+        self.auto_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Ready")
 
         self.build_ui()
-        self.root.after(120, self.process_events)
+        self.refresh_key_status()
+        self.refresh_buttons()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.after(100, self.process_events)
 
+    # ------------------------------------------------------------------ UI
     def build_ui(self):
-        outer = ttk.Frame(self.root, padding=18)
-        outer.pack(fill="both", expand=True)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(1, weight=1)
 
-        ttk.Label(
-            outer, text="YouTube Viral Clips Generator",
-            font=("Segoe UI", 19, "bold")
-        ).pack(anchor="w")
-        ttk.Label(
-            outer,
-            text="Choose clip length and editing instructions; Gemini finds moments and creates clips.",
-            font=("Segoe UI", 10)
-        ).pack(anchor="w", pady=(4, 14))
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=22, pady=(18, 10))
+        titles = ctk.CTkFrame(header, fg_color="transparent")
+        titles.pack(side="left")
+        ctk.CTkLabel(titles, text="Viral Clips Studio", font=font(24, "bold"), text_color=TEXT).pack(anchor="w")
+        ctk.CTkLabel(titles, text="Turn one long YouTube video into five short clips.",
+                     font=font(13), text_color=MUTED).pack(anchor="w")
+        quiet_button(header, "Settings", self.open_settings, width=96).pack(side="right")
+        quiet_button(header, "Output folder", self.open_output, width=120).pack(side="right", padx=8)
 
-        settings = ttk.LabelFrame(outer, text="1. Video settings", padding=12)
-        settings.pack(fill="x", pady=(0, 12))
+        # Sidebar
+        side = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=14, width=380)
+        side.grid(row=1, column=0, sticky="ns", padx=(22, 10), pady=(0, 10))
+        side.grid_propagate(False)
+        side.grid_columnconfigure(0, weight=1)
 
-        ttk.Label(settings, text="YouTube video URL").grid(row=0, column=0, sticky="w")
-        ttk.Entry(settings, textvariable=self.url_var).grid(
-            row=1, column=0, columnspan=2, sticky="ew", pady=(4, 10)
-        )
+        field_label(side, "YouTube link").grid(row=0, column=0, sticky="w", padx=20, pady=(20, 0))
+        url_row = ctk.CTkFrame(side, fg_color="transparent")
+        url_row.grid(row=1, column=0, sticky="ew", padx=20, pady=(4, 12))
+        url_row.grid_columnconfigure(0, weight=1)
+        self.url_entry = ctk.CTkEntry(url_row, height=38, fg_color=BG, border_color=LINE, text_color=TEXT,
+                                      placeholder_text="https://www.youtube.com/watch?v=…", font=font(13))
+        self.url_entry.grid(row=0, column=0, sticky="ew")
+        self.url_entry.bind("<Return>", lambda e: self.on_primary())
+        quiet_button(url_row, "Paste", self.paste_url, width=64, height=38).grid(row=0, column=1, padx=(8, 0))
 
-        ttk.Label(settings, text="Download quality").grid(row=2, column=0, sticky="w")
-        ttk.Label(settings, text="Output aspect ratio").grid(row=2, column=1, sticky="w")
+        field_label(side, "Download quality").grid(row=2, column=0, sticky="w", padx=20)
+        option_menu(side, list(QUALITY_OPTIONS), self.quality_var).grid(
+            row=3, column=0, sticky="ew", padx=20, pady=(4, 12))
+        field_label(side, "Output shape").grid(row=4, column=0, sticky="w", padx=20)
+        option_menu(side, list(RATIO_OPTIONS), self.ratio_var).grid(
+            row=5, column=0, sticky="ew", padx=20, pady=(4, 12))
+        field_label(side, "Clip length").grid(row=6, column=0, sticky="w", padx=20)
+        option_menu(side, list(DURATION_OPTIONS), self.duration_var).grid(
+            row=7, column=0, sticky="ew", padx=20, pady=(4, 12))
 
-        ttk.Combobox(
-            settings, textvariable=self.quality_var,
-            values=list(QUALITY_OPTIONS.keys()), state="readonly"
-        ).grid(row=3, column=0, sticky="ew", padx=(0, 8), pady=(4, 0))
+        field_label(side, "Instructions for Gemini (optional)").grid(row=8, column=0, sticky="w", padx=20)
+        self.instructions_box = ctk.CTkTextbox(side, height=92, fg_color=BG, border_width=1, border_color=LINE,
+                                               text_color=TEXT, font=font(13), wrap="word")
+        self.instructions_box.grid(row=9, column=0, sticky="ew", padx=20, pady=(4, 12))
+        self.instructions_box.insert("1.0", DEFAULT_INSTRUCTIONS)
 
-        ttk.Combobox(
-            settings, textvariable=self.ratio_var,
-            values=list(RATIO_OPTIONS.keys()), state="readonly"
-        ).grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=(4, 0))
+        ctk.CTkSwitch(side, text="Create clips right after analysis", variable=self.auto_var,
+                      command=self.refresh_buttons, text_color=SOFT, font=font(13),
+                      progress_color=ACCENT, button_color=TEXT, button_hover_color=SOFT).grid(
+            row=10, column=0, sticky="w", padx=20, pady=(2, 14))
 
-        ttk.Label(settings, text="Clip duration").grid(row=4, column=0, sticky="w", pady=(10, 0))
-        ttk.Combobox(
-            settings, textvariable=self.duration_var,
-            values=list(DURATION_OPTIONS.keys()), state="readonly"
-        ).grid(row=5, column=0, sticky="ew", padx=(0, 8), pady=(4, 0))
+        status_box = ctk.CTkFrame(side, fg_color=BG, corner_radius=10)
+        status_box.grid(row=11, column=0, sticky="ew", padx=20, pady=(0, 20))
+        status_box.grid_columnconfigure(0, weight=1)
+        self.key_label = ctk.CTkLabel(status_box, text="", anchor="w", justify="left", wraplength=290,
+                                      font=font(12), text_color=SOFT)
+        self.key_label.grid(row=0, column=0, sticky="ew", padx=14, pady=12)
 
-        ttk.Label(settings, text="Additional instructions for Gemini (optional)").grid(
-            row=4, column=1, sticky="w", pady=(10, 0)
-        )
-        self.instructions_text = tk.Text(settings, height=3, wrap="word", font=("Segoe UI", 9))
-        self.instructions_text.grid(row=5, column=1, sticky="ew", padx=(8, 0), pady=(4, 0))
-        self.instructions_text.insert(
-            "1.0",
-            "Prioritize funny moments with a strong punchline. Keep the full setup and reaction."
-        )
+        # Main area
+        main = ctk.CTkFrame(self, fg_color="transparent")
+        main.grid(row=1, column=1, sticky="nsew", padx=(10, 22), pady=(0, 10))
+        main.grid_columnconfigure(0, weight=1)
+        main.grid_rowconfigure(1, weight=1)
 
-        settings.columnconfigure(0, weight=1)
-        settings.columnconfigure(1, weight=1)
+        step_bar = ctk.CTkFrame(main, fg_color="transparent")
+        step_bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self.step_labels = []
+        for i, name in enumerate(STEPS):
+            label = ctk.CTkLabel(step_bar, text=f"{i + 1}. {name}", height=30, corner_radius=15,
+                                 fg_color=RAISED, text_color=MUTED, font=font(12, "bold"), padx=14)
+            label.pack(side="left", padx=(0, 8))
+            self.step_labels.append(label)
 
-        workflow = ttk.LabelFrame(outer, text="2. Automatic transcript + Gemini AI", padding=12)
-        workflow.pack(fill="x", pady=(0, 12))
-        ttk.Label(
-            workflow,
-            text=(
-                "The app first tries to download YouTube captions automatically. "
-                "If captions are unavailable, it will ask you to select a timestamped "
-                "VTT, SRT, or TXT transcript."
-            ),
-            wraplength=850
-        ).pack(anchor="w")
-        ttk.Label(
-            workflow,
-            text=f"Gemini model: {GEMINI_MODEL}",
-            foreground="#2878b5"
-        ).pack(anchor="w", pady=(7, 0))
+        self.tabs = ctk.CTkTabview(
+            main, fg_color=PANEL, corner_radius=14, segmented_button_fg_color=BG,
+            segmented_button_selected_color=ACCENT, segmented_button_selected_hover_color=ACCENT_HOVER,
+            segmented_button_unselected_color=BG, segmented_button_unselected_hover_color=RAISED,
+            text_color=TEXT)
+        self.tabs.grid(row=1, column=0, sticky="nsew")
+        for name in ("Clips", "Log", "JSON"):
+            self.tabs.add(name)
+        self.tabs._segmented_button.configure(font=font(13, "bold"), text_color=TEXT)
 
-        output_frame = ttk.LabelFrame(outer, text="3. AI-generated top 5 moments (preview)", padding=10)
-        output_frame.pack(fill="both", expand=True, pady=(0, 12))
+        clips_tab = self.tabs.tab("Clips")
+        clips_tab.grid_columnconfigure(0, weight=1)
+        clips_tab.grid_rowconfigure(0, weight=1)
+        self.clips_frame = ctk.CTkScrollableFrame(clips_tab, fg_color="transparent")
+        self.clips_frame.grid(row=0, column=0, sticky="nsew")
+        self.clips_frame.grid_columnconfigure(0, weight=1)
+        self.empty_label = ctk.CTkLabel(
+            self.clips_frame, text_color=MUTED, font=font(14), justify="center",
+            text="No clips yet.\nPaste a YouTube link on the left and press Analyze.")
+        self.empty_label.grid(row=0, column=0, pady=90)
 
-        text_frame = ttk.Frame(output_frame)
-        text_frame.pack(fill="both", expand=True)
-        self.result_text = tk.Text(
-            text_frame, height=11, wrap="none", font=("Consolas", 9),
-            state="disabled"
-        )
-        y_scroll = ttk.Scrollbar(text_frame, orient="vertical", command=self.result_text.yview)
-        x_scroll = ttk.Scrollbar(text_frame, orient="horizontal", command=self.result_text.xview)
-        self.result_text.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
-        self.result_text.grid(row=0, column=0, sticky="nsew")
-        y_scroll.grid(row=0, column=1, sticky="ns")
-        x_scroll.grid(row=1, column=0, sticky="ew")
-        text_frame.rowconfigure(0, weight=1)
-        text_frame.columnconfigure(0, weight=1)
+        log_tab = self.tabs.tab("Log")
+        log_tab.grid_columnconfigure(0, weight=1)
+        log_tab.grid_rowconfigure(0, weight=1)
+        self.log_box = ctk.CTkTextbox(log_tab, fg_color=BG, text_color=SOFT, font=font(12, mono=True),
+                                      wrap="word", state="disabled")
+        self.log_box.grid(row=0, column=0, sticky="nsew")
+        self.log_box.tag_config("warn", foreground=WARN)
+        self.log_box.tag_config("error", foreground=BAD)
+        self.log_box.tag_config("ok", foreground=GOOD)
 
-        controls = ttk.Frame(outer)
-        controls.pack(fill="x", pady=(0, 10))
-        self.start_button = ttk.Button(
-            controls, text="Download, Analyze & Generate Clips", command=self.start
-        )
-        self.start_button.pack(side="left")
-        self.reset_button = ttk.Button(
-            controls, text="Reset for Next Video", command=self.reset, state="disabled"
-        )
-        self.reset_button.pack(side="left", padx=(8, 0))
-        ttk.Button(
-            controls, text="Open Output Folder", command=self.open_output
-        ).pack(side="right")
+        json_tab = self.tabs.tab("JSON")
+        json_tab.grid_columnconfigure(0, weight=1)
+        json_tab.grid_rowconfigure(0, weight=1)
+        self.json_box = ctk.CTkTextbox(json_tab, fg_color=BG, text_color=SOFT, font=font(12, mono=True),
+                                       wrap="none", state="disabled")
+        self.json_box.grid(row=0, column=0, sticky="nsew")
+        quiet_button(json_tab, "Copy JSON", self.copy_json, width=110).grid(row=1, column=0, sticky="e", pady=(8, 0))
 
-        progress_frame = ttk.LabelFrame(outer, text="4. Progress", padding=10)
-        progress_frame.pack(fill="x")
-        ttk.Label(progress_frame, textvariable=self.status_var).pack(anchor="w")
-        self.progress_var = tk.DoubleVar(value=0)
-        ttk.Progressbar(
-            progress_frame, variable=self.progress_var, maximum=100
-        ).pack(fill="x", pady=(7, 0))
+        # Bottom bar
+        bottom = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=14)
+        bottom.grid(row=2, column=0, columnspan=2, sticky="ew", padx=22, pady=(0, 20))
+        bottom.grid_columnconfigure(0, weight=1)
 
-        self.log_text = tk.Text(
-            outer, height=6, wrap="word", state="disabled", font=("Consolas", 9)
-        )
-        self.log_text.pack(fill="x", pady=(10, 0))
+        progress_area = ctk.CTkFrame(bottom, fg_color="transparent")
+        progress_area.grid(row=0, column=0, sticky="ew", padx=(20, 12), pady=14)
+        progress_area.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(progress_area, textvariable=self.status_var, anchor="w", text_color=TEXT,
+                     font=font(13)).grid(row=0, column=0, sticky="ew")
+        self.progress = ctk.CTkProgressBar(progress_area, height=8, progress_color=ACCENT, fg_color=RAISED)
+        self.progress.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.progress.set(0)
 
-    def log(self, message):
-        self.events.put(("log", message))
+        buttons = ctk.CTkFrame(bottom, fg_color="transparent")
+        buttons.grid(row=0, column=1, padx=(0, 20), pady=14)
+        self.reset_btn = quiet_button(buttons, "New video", self.reset, width=100, height=38)
+        self.reset_btn.pack(side="left", padx=(0, 8))
+        self.cancel_btn = ctk.CTkButton(buttons, text="Cancel", command=self.cancel_job, width=90, height=38,
+                                        fg_color="#5a2a2e", hover_color="#733439", text_color="#ffd9d9",
+                                        font=font(13), corner_radius=8)
+        self.cancel_btn.pack(side="left", padx=(0, 8))
+        self.create_btn = primary_button(buttons, "Create selected clips", self.create_selected, width=180)
+        self.create_btn.pack(side="left", padx=(0, 8))
+        self.start_btn = primary_button(buttons, "Analyze and create clips", self.on_primary, width=200)
+        self.start_btn.pack(side="left")
+
+    def refresh_key_status(self):
+        if Config.api_key:
+            self.key_label.configure(
+                text=f"Gemini is ready ({Config.model}). If it fails, you can finish by hand in the Gemini chat.",
+                text_color=SOFT)
+        else:
+            self.key_label.configure(
+                text="No Gemini API key yet. Add one in Settings, or continue and use the Gemini chat by hand.",
+                text_color=WARN)
+
+    def refresh_buttons(self):
+        s = self.app_state
+        idle = s in ("idle", "finished")
+        self.start_btn.configure(
+            state="normal" if idle else "disabled",
+            text="Analyze and create clips" if self.auto_var.get() else "Analyze video")
+        self.reset_btn.configure(state="normal" if idle else "disabled")
+        self.cancel_btn.configure(state="normal" if s in ("running", "review") else "disabled")
+        if s == "review":
+            self.create_btn.configure(state="normal")
+            self.create_btn.pack(side="left", padx=(0, 8), before=self.start_btn)
+        else:
+            self.create_btn.pack_forget()
+
+    # ------------------------------------------------------ thread-safe calls
+    def log(self, message, level="info"):
+        self.events.put(("log", (message, level)))
 
     def set_status(self, message):
         self.events.put(("status", message))
@@ -563,238 +1455,550 @@ class ViralClipsApp:
     def set_progress(self, value):
         self.events.put(("progress", value))
 
-    def set_result_json(self, data):
-        self.events.put(("json", json.dumps(data, ensure_ascii=False, indent=2)))
+    def set_step(self, index, state):
+        self._step_index, self._step_state = index, state
+        self.events.put(("step", (index, state)))
 
-    def start(self):
-        if self.is_running:
-            return
+    def wait_for(self, waiter):
+        while not waiter.event.wait(0.25):
+            if self.job.cancel.is_set():
+                raise JobCancelled()
+        if self.job.cancel.is_set():
+            raise JobCancelled()
+        return waiter.value
 
-        url = self.url_var.get().strip()
-        if not url:
-            messagebox.showwarning("Missing URL", "Please enter a YouTube video URL.")
-            return
-        if not GEMINI_API_KEY:
-            messagebox.showerror(
-                "Gemini API key missing",
-                "Add GEMINI_API_KEY and GEMINI_MODEL to the .env file beside main.py, then restart the app."
-            )
-            return
+    def ask(self, kind, **payload):
+        waiter = Waiter()
+        self.events.put(("dialog", (kind, payload, waiter)))
+        return self.wait_for(waiter)
 
-        self.is_running = True
-        self.start_button.configure(state="disabled")
-        self.progress_var.set(0)
-        self.status_var.set("Starting...")
-        self.result_text.configure(state="normal")
-        self.result_text.delete("1.0", "end")
-        self.result_text.configure(state="disabled")
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
-
-        args = (
-            url,
-            QUALITY_OPTIONS[self.quality_var.get()],
-            RATIO_OPTIONS[self.ratio_var.get()],
-            DURATION_OPTIONS[self.duration_var.get()],
-            self.instructions_text.get("1.0", "end").strip(),
-        )
-        threading.Thread(target=self.worker, args=args, daemon=True).start()
-
-    def worker(self, url, quality, ratio, clip_duration_range, user_instructions):
+    # ----------------------------------------------------------- user actions
+    def paste_url(self):
         try:
-            if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-                raise RuntimeError(
-                    "FFmpeg/ffprobe not found in PATH. Restart PowerShell/Windows and verify ffmpeg -version."
-                )
-
-            self.set_status("Downloading YouTube video...")
-            self.log("Starting video download.")
-            video_path, info = download_video(
-                url, quality, self.log, self.set_status, self.set_progress
-            )
-            self.log(f"Video downloaded and merged: {video_path.name}")
-            self.set_progress(40)
-
-            self.set_status("Trying to download transcript...")
-            self.log("Checking YouTube subtitles and automatic captions.")
-            transcript_path = download_transcript(url, info, self.log)
-
-            if transcript_path is None:
-                self.log("Automatic transcript download was unavailable.")
-                self.set_status("Please select a transcript file.")
-                waiter = threading.Event()
-                self.transcript_waiter = waiter
-                self.transcript_result = None
-                self.events.put(("ask_transcript", None))
-                waiter.wait()
-                transcript_path = self.transcript_result
-                self.transcript_waiter = None
-
-                if not transcript_path:
-                    raise RuntimeError("No transcript was selected. Processing cancelled.")
-
-            transcript_text = parse_timestamped_subtitles(Path(transcript_path))
-            self.log(f"Transcript ready: {Path(transcript_path).name}")
-            self.set_progress(50)
-
-            self.set_status("Analyzing transcript with Gemini AI...")
-            self.log(f"Sending timestamped transcript to Gemini ({GEMINI_MODEL}).")
-            duration = get_duration(video_path)
-            video_title = info.get("title") or video_path.stem
-
-            data = generate_top_clips_with_gemini(
-                transcript_text, video_title, url, duration,
-                clip_duration_range, user_instructions
-            )
-            clips = validate_clips(
-                data["top_5_viral_clips"], duration, clip_duration_range
-            )
-            self.set_result_json(data)
-            self.log("Gemini generated the top 5 moments.")
-            self.set_progress(60)
-
-            output_folder = OUTPUT_DIR / safe_name(data.get("video_title", video_title))
-            output_folder.mkdir(parents=True, exist_ok=True)
-
-            successful = 0
-            failed = 0
-            for index, (clip, start, end) in enumerate(clips, 1):
-                try:
-                    rank = int(clip.get("rank", index))
-                except (TypeError, ValueError):
-                    rank = index
-                clip_title = safe_name(clip.get("title", f"clip_{rank}"), 80)
-                output_path = output_folder / f"{rank:02d}_{clip_title}.mp4"
-
-                self.set_status(f"Creating clip {index} of {len(clips)}: {clip_title}")
-                self.log(f"[{index}/5] Cutting {clip_title} ({start:.1f}s–{end:.1f}s)")
-                try:
-                    cut_clip(video_path, output_path, start, end, ratio)
-                    successful += 1
-                    self.log(f"  DONE: {output_path.name}")
-                except subprocess.CalledProcessError as exc:
-                    failed += 1
-                    detail = (exc.stderr or str(exc)).strip().splitlines()
-                    self.log(f"  FAILED: {detail[-1] if detail else 'FFmpeg error'}")
-
-                self.set_progress(60 + index / len(clips) * 40)
-
-            summary = (
-                f"Processing finished!\n\n"
-                f"Clips created: {successful}\n"
-                f"Failed: {failed}\n\n"
-                f"Output folder:\n{output_folder}"
-            )
-            self.set_status("Completed")
-            self.log(summary.replace("\n", " | "))
-            self.events.put(("done", True))
-            self.events.put(("info", summary))
-
-        except Exception as exc:
-            self.log(f"ERROR: {exc}")
-            self.set_status("Stopped due to an error")
-            self.events.put(("done", False))
-            self.events.put(("error", str(exc)))
-
-    def process_events(self):
-        try:
-            while True:
-                kind, value = self.events.get_nowait()
-                if kind == "log":
-                    self.log_text.configure(state="normal")
-                    self.log_text.insert("end", value + "\n")
-                    self.log_text.see("end")
-                    self.log_text.configure(state="disabled")
-                elif kind == "status":
-                    self.status_var.set(value)
-                elif kind == "progress":
-                    self.progress_var.set(value)
-                elif kind == "json":
-                    self.result_text.configure(state="normal")
-                    self.result_text.delete("1.0", "end")
-                    self.result_text.insert("1.0", value)
-                    self.result_text.configure(state="disabled")
-                elif kind == "done":
-                    self.is_running = False
-                    self.start_button.configure(state="normal")
-                    self.reset_button.configure(state="normal")
-                    if value:
-                        self.progress_var.set(100)
-                elif kind == "error":
-                    messagebox.showerror("Processing error", value)
-                elif kind == "info":
-                    messagebox.showinfo("Clips generated", value)
-                elif kind == "ask_transcript":
-                    selected = filedialog.askopenfilename(
-                        title="Select timestamped transcript",
-                        filetypes=[
-                            ("Transcript files", "*.vtt *.srt *.txt"),
-                            ("WebVTT subtitles", "*.vtt"),
-                            ("SubRip subtitles", "*.srt"),
-                            ("Text files", "*.txt"),
-                            ("All files", "*.*"),
-                        ],
-                    )
-                    self.transcript_result = selected or None
-                    if self.transcript_waiter:
-                        self.transcript_waiter.set()
-        except queue.Empty:
-            pass
-        self.root.after(120, self.process_events)
-
-    def reset(self):
-        if self.is_running:
-            messagebox.showinfo("Please wait", "Wait for the current job to finish before resetting.")
+            text = self.clipboard_get().strip()
+        except tk.TclError:
             return
+        self.url_entry.delete(0, "end")
+        self.url_entry.insert(0, text)
 
-        self.url_var.set("")
-        self.quality_var.set("720p or lower")
-        self.ratio_var.set("Vertical 9:16 (Reels / Shorts)")
-        self.duration_var.set("20–25 seconds")
-
-        self.instructions_text.delete("1.0", "end")
-        self.instructions_text.insert(
-            "1.0",
-            "Prioritize funny moments with a strong punchline. Keep the full setup and reaction."
-        )
-
-        self.result_text.configure(state="normal")
-        self.result_text.delete("1.0", "end")
-        self.result_text.configure(state="disabled")
-
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
-
-        self.progress_var.set(0)
-        self.status_var.set("Ready for the next video")
-        self.reset_button.configure(state="disabled")
-        self.start_button.configure(state="normal")
+    def open_settings(self):
+        if self.app_state in ("running", "review"):
+            messagebox.showinfo("Please wait", "Settings can be changed after the current job finishes.")
+            return
+        SettingsDialog(self, self.refresh_key_status)
 
     def open_output(self):
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        open_path(self.last_output_folder if self.last_output_folder and self.last_output_folder.exists()
+                  else OUTPUT_DIR)
+
+    def copy_json(self):
+        text = self.json_box.get("1.0", "end").strip()
+        if text:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+
+    def on_primary(self):
+        if self.app_state not in ("idle", "finished"):
+            return
+        url = self.url_entry.get().strip()
+        if not url:
+            messagebox.showwarning("Missing link", "Paste a YouTube video link first.")
+            self.url_entry.focus_set()
+            return
+        if not re.match(r"^https?://", url, re.I):
+            url = "https://" + url
+            self.url_entry.delete(0, "end")
+            self.url_entry.insert(0, url)
+        if not re.match(r"^https?://([\w-]+\.)?(youtube\.com|youtu\.be|youtube-nocookie\.com)/", url, re.I):
+            if not messagebox.askyesno(
+                    "Not a YouTube link",
+                    "This does not look like a YouTube link. Captions may not be found automatically.\n\n"
+                    "Try it anyway?"):
+                return
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            messagebox.showerror("FFmpeg not found", FFMPEG_HELP)
+            return
+        if not Config.api_key:
+            answer = messagebox.askyesnocancel(
+                "No Gemini API key",
+                "There is no Gemini API key, so the app cannot ask Gemini by itself.\n\n"
+                "Yes: continue and finish the AI step by hand in the Gemini chat\n"
+                "No: open Settings to add a key\n"
+                "Cancel: go back")
+            if answer is None:
+                return
+            if answer is False:
+                self.open_settings()
+                return
+
+        self.job = Job(
+            url=url,
+            quality=QUALITY_OPTIONS[self.quality_var.get()],
+            ratio=RATIO_OPTIONS[self.ratio_var.get()],
+            duration_range=DURATION_OPTIONS[self.duration_var.get()],
+            instructions=self.instructions_box.get("1.0", "end").strip(),
+            auto_create=self.auto_var.get(),
+            cancel=threading.Event(),
+        )
+        self.clear_results()
+        self.app_state = "running"
+        self.refresh_buttons()
+        self.set_status_now("Starting…")
+        threading.Thread(target=self.run_job, args=(self.job,), daemon=True).start()
+
+    def create_selected(self):
+        if self.app_state != "review" or not self.review_waiter:
+            return
+        selected = [i for i, card in enumerate(self.cards) if card.var.get()]
+        if not selected:
+            messagebox.showwarning("No clips selected", "Tick at least one clip to create.")
+            return
+        waiter, self.review_waiter = self.review_waiter, None
+        self.app_state = "running"
+        self.refresh_buttons()
+        waiter.resolve(selected)
+
+    def cancel_job(self):
+        if self.app_state not in ("running", "review") or not self.job:
+            return
+        if not messagebox.askyesno("Cancel job", "Stop the current job?"):
+            return
+        self.job.cancel.set()
+        if self.active_dialog is not None:
+            self.active_dialog.close(None)
+        if self.review_waiter is not None:
+            self.review_waiter.resolve(None)
+        self.set_status_now("Cancelling…")
+
+    def reset(self):
+        if self.app_state not in ("idle", "finished"):
+            return
+        self.url_entry.delete(0, "end")
+        self.quality_var.set("720p or lower")
+        self.ratio_var.set("Vertical 9:16 (Reels / Shorts)")
+        self.duration_var.set("20–25 seconds")
+        self.instructions_box.delete("1.0", "end")
+        self.instructions_box.insert("1.0", DEFAULT_INSTRUCTIONS)
+        self.clear_results()
+        self.app_state = "idle"
+        self.set_status_now("Ready for the next video")
+        self.refresh_buttons()
+        self.url_entry.focus_set()
+
+    def clear_results(self):
+        for card in self.cards:
+            card.destroy()
+        self.cards = []
+        self.empty_label.grid(row=0, column=0, pady=90)
+        set_textbox(self.json_box, "")
+        set_textbox(self.log_box, "")
+        for i in range(len(STEPS)):
+            self.apply_step(i, "pending")
+        self.progress.set(0)
+        self.tabs.set("Clips")
+
+    def set_status_now(self, text):
+        self.status_var.set(text)
+
+    def on_close(self):
+        if self.app_state in ("running", "review"):
+            if not messagebox.askyesno("Quit", "A job is still running. Stop it and quit?"):
+                return
+            if self.job:
+                self.job.cancel.set()
+        self._alive = False
+        self.destroy()
+
+    # --------------------------------------------------------- event handling
+    def apply_step(self, index, state):
+        bg, fg = self.STEP_COLORS[state]
+        mark = {"done": "✓ ", "failed": "✕ "}.get(state, "")
+        self.step_labels[index].configure(fg_color=bg, text_color=fg, text=f"{mark}{index + 1}. {STEPS[index]}")
+
+    def append_log(self, message, level):
+        stamp = time.strftime("%H:%M:%S")
+        tag = {"warn": "warn", "error": "error", "ok": "ok"}.get(level)
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", f"{stamp}  {message}\n", tag) if tag else \
+            self.log_box.insert("end", f"{stamp}  {message}\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def show_clips(self, clips):
+        for card in self.cards:
+            card.destroy()
+        self.cards = []
+        self.empty_label.grid_remove()
+        for i, clip in enumerate(clips):
+            card = ClipCard(self.clips_frame, clip)
+            card.grid(row=i, column=0, sticky="ew", pady=(0, 10), padx=(0, 6))
+            self.cards.append(card)
+        self.tabs.set("Clips")
+
+    def open_dialog(self, kind, payload, waiter):
+        def finish(value):
+            self.active_dialog = None
+            waiter.resolve(value)
+
+        if kind == "transcript":
+            self.active_dialog = TranscriptDialog(self, payload["reason"], payload.get("error"), finish)
+        elif kind == "manual_ai":
+            self.active_dialog = ManualGeminiDialog(
+                self, payload["reason"], payload["folder"], payload["prompt"], payload["validator"], finish)
+
+    def process_events(self):
+        if not self._alive:
+            return
         try:
-            if os.name == "nt":
-                os.startfile(str(OUTPUT_DIR))
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(OUTPUT_DIR)])
-            else:
-                subprocess.Popen(["xdg-open", str(OUTPUT_DIR)])
+            while True:
+                kind, value = self.events.get_nowait()
+                try:
+                    self.handle_event(kind, value)
+                except Exception:
+                    traceback.print_exc()
+        except queue.Empty:
+            pass
+        self.after(100, self.process_events)
+
+    def handle_event(self, kind, value):
+        if kind == "log":
+            self.append_log(*value)
+        elif kind == "status":
+            self.status_var.set(value)
+        elif kind == "progress":
+            self.progress.set(max(0.0, min(1.0, value / 100)))
+        elif kind == "step":
+            self.apply_step(*value)
+        elif kind == "clips":
+            self.show_clips(value)
+        elif kind == "json":
+            set_textbox(self.json_box, value)
+        elif kind == "state":
+            self.app_state = value
+            self.refresh_buttons()
+        elif kind == "dialog":
+            self.open_dialog(*value)
+        elif kind == "clip_status":
+            index, text, color, path = value
+            if index < len(self.cards):
+                self.cards[index].set_status(text, color, path)
+        elif kind == "finished":
+            self.finish_job(value)
+
+    def finish_job(self, result):
+        self.app_state = "finished"
+        self.review_waiter = None
+        self.refresh_buttons()
+        if result.get("folder"):
+            self.last_output_folder = result["folder"]
+        if result.get("ok"):
+            self.progress.set(1)
+            self.set_status_now("Done")
+            if messagebox.askyesno("Clips ready", result["message"] + "\n\nOpen the output folder now?"):
+                open_path(result["folder"])
+        elif result.get("cancelled"):
+            self.set_status_now("Cancelled")
+        else:
+            self.set_status_now("Stopped. See the message for what to do next.")
+            messagebox.showerror("Something went wrong", result["message"])
+
+    # --------------------------------------------------------------- pipeline
+    def run_job(self, job):
+        try:
+            title, duration, transcript_text, info = self.step_info(job)
+            transcript_text = self.step_transcript(job, info)
+            clips = self.step_ai(job, info, title, duration, transcript_text)
+            if not job.auto_create:
+                selected = self.step_review(job)
+                clips = [clips[i] for i in selected]
+            folder, ok, failed = self.step_download_and_cut(job, title, clips)
+
+            lines = [f"Clips created: {ok}"]
+            if failed:
+                lines.append(f"Failed: {failed} (see the Log tab)")
+            lines.append(f"\nSaved in:\n{folder}")
+            result = {"ok": ok > 0, "folder": folder, "message": "\n".join(lines)}
+            if ok == 0:
+                result["message"] = "No clip could be created. Open the Log tab to see the FFmpeg messages."
+            self.events.put(("finished", result))
+        except JobCancelled:
+            self.mark_step_failed()
+            self.log("Job cancelled.", "warn")
+            self.events.put(("finished", {"cancelled": True}))
         except Exception as exc:
-            messagebox.showerror("Cannot open folder", str(exc))
+            self.mark_step_failed()
+            message = friendly_error(exc)
+            self.log(f"ERROR: {message}", "error")
+            if not isinstance(exc, UserFacingError):
+                self.log(traceback.format_exc(), "error")
+            self.events.put(("finished", {"ok": False, "message": message}))
+
+    def mark_step_failed(self):
+        if self._step_index is not None and self._step_state == "active":
+            self.set_step(self._step_index, "failed")
+
+    # step 1 ---------------------------------------------------------------
+    def step_info(self, job):
+        self.set_step(0, "active")
+        self.set_status("Reading video information…")
+        self.set_progress(2)
+        info = fetch_video_info(job.url)
+        if job.cancel.is_set():
+            raise JobCancelled()
+
+        if info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming"):
+            raise UserFacingError("This is a live stream or an upcoming premiere. Wait until it has "
+                                  "finished, then paste the link again.")
+        title = info.get("title") or "YouTube video"
+        duration = info.get("duration")
+        self.log(f"Video: {title}")
+        if duration:
+            self.log(f"Length: {format_timestamp(duration)}")
+            if duration < job.duration_range[0]:
+                raise UserFacingError(
+                    f"This video is only {duration:.0f} seconds long, shorter than the minimum clip length "
+                    f"({job.duration_range[0]}s). Choose a shorter clip length.")
+            if duration > 4 * 3600:
+                self.log("This is a very long video. Download and AI analysis may take a while.", "warn")
+        self.set_step(0, "done")
+        self.set_progress(8)
+        return title, duration, None, info
+
+    # step 2 ---------------------------------------------------------------
+    def step_transcript(self, job, info):
+        self.set_step(1, "active")
+        self.set_status("Looking for captions…")
+        path = None
+        try:
+            path = download_transcript(job.url, info, self.log, job.cancel)
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            self.log(f"Automatic caption download failed: {friendly_error(exc)}", "warn")
+
+        if path:
+            try:
+                text = parse_transcript_text(read_text_file(path))
+                self.log(f"Transcript ready: {path.name} ({len(text.splitlines())} lines)", "ok")
+                self.set_step(1, "done")
+                self.set_progress(18)
+                return text
+            except (ValueError, OSError) as exc:
+                self.log(f"Downloaded captions could not be used: {exc}", "warn")
+
+        self.set_status("Waiting for a transcript from you…")
+        reason = ("YouTube captions could not be downloaded automatically. Choose a timestamped transcript "
+                  "file, or paste the transcript text.")
+        error = None
+        while True:
+            answer = self.ask("transcript", reason=reason, error=error)
+            if not answer:
+                raise UserFacingError("No transcript was provided, so the job was stopped.")
+            kind, value = answer
+            try:
+                raw = read_text_file(value) if kind == "file" else value
+                text = parse_transcript_text(raw)
+                break
+            except (ValueError, OSError) as exc:
+                error = str(exc)
+                self.log(f"Transcript rejected: {error}", "warn")
+        self.log(f"Transcript ready ({len(text.splitlines())} lines).", "ok")
+        self.set_step(1, "done")
+        self.set_progress(18)
+        return text
+
+    # step 3 ---------------------------------------------------------------
+    def step_ai(self, job, info, title, duration, transcript_text):
+        self.set_step(2, "active")
+        rng = job.duration_range
+        reason = None
+
+        if not Config.api_key:
+            reason = "No Gemini API key is set, so Gemini could not be called."
+            self.log(reason, "warn")
+        else:
+            try:
+                clips = self.ask_gemini(job, title, duration, transcript_text)
+                self.finish_ai_step(job, title, clips)
+                return clips
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                reason = f"Gemini could not produce valid clips. {friendly_error(exc)}"
+                self.log(f"AI step failed: {reason}", "error")
+
+        clips = self.manual_gemini(job, title, duration, transcript_text, reason)
+        self.finish_ai_step(job, title, clips)
+        return clips
+
+    def finish_ai_step(self, job, title, clips):
+        payload = {
+            "video_title": title,
+            "source_url": job.url,
+            "top_5_viral_clips": [c.to_json() for c in clips],
+        }
+        self.events.put(("json", json.dumps(payload, ensure_ascii=False, indent=2)))
+        self.events.put(("clips", clips))
+        self.log(f"{len(clips)} clips ready.", "ok")
+        self.set_step(2, "done")
+        self.set_progress(30)
+
+    def ask_gemini(self, job, title, duration, transcript_text):
+        rng = job.duration_range
+        feedback = None
+        last_error = None
+        for attempt in range(1, MAX_AI_ATTEMPTS + 1):
+            if job.cancel.is_set():
+                raise JobCancelled()
+            self.set_status(f"Asking Gemini… (attempt {attempt} of {MAX_AI_ATTEMPTS})")
+            self.set_progress(20 + attempt * 2)
+            self.log(f"Sending the transcript to Gemini ({Config.model}), attempt {attempt}.")
+            prompt = build_prompt(title, job.url, duration, rng, job.instructions,
+                                  transcript_text=transcript_text, feedback=feedback)
+            try:
+                text = call_gemini(prompt)
+                raw_clips = extract_raw_clips(text)
+                clips, problems = build_clips(raw_clips, duration, rng)
+                if len(clips) == REQUIRED_CLIPS:
+                    return clips
+                feedback = " ".join(problems[:4]) or f"Only {len(clips)} usable clips were returned."
+                raise ValueError(feedback)
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                last_error = exc
+                self.log(f"Attempt {attempt} failed: {friendly_error(exc)}", "warn")
+                if is_fatal_ai_error(exc):
+                    break
+                if attempt < MAX_AI_ATTEMPTS:
+                    delay = 3 * attempt
+                    self.log(f"Retrying in {delay}s…")
+                    if job.cancel.wait(delay):
+                        raise JobCancelled()
+        raise last_error or RuntimeError("Gemini did not return usable clips.")
+
+    def manual_gemini(self, job, title, duration, transcript_text, reason):
+        """Fallback: save transcript + prompt, let the user run Gemini chat, paste JSON back."""
+        rng = job.duration_range
+        folder = MANUAL_DIR / safe_name(title, 60)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "transcript.txt").write_text(transcript_text, encoding="utf-8")
+        prompt = build_prompt(title, job.url, duration, rng, job.instructions, transcript_text=None)
+        (folder / "prompt.txt").write_text(prompt, encoding="utf-8")
+        self.log(f"Manual Gemini files saved in {folder}", "warn")
+
+        def validator(text, parent):
+            try:
+                raw_clips = extract_raw_clips(text)
+            except ValueError as exc:
+                return None, str(exc)
+            clips, problems = build_clips(raw_clips, duration, rng)
+            if len(clips) == REQUIRED_CLIPS:
+                return clips, None
+            if not clips:
+                return None, "No usable clips in that answer.\n" + "\n".join(problems[:5])
+            if messagebox.askyesno(
+                    "Some clips are not usable",
+                    f"{len(clips)} of {REQUIRED_CLIPS} clips are usable.\n\n" + "\n".join(problems[:5]) +
+                    "\n\nContinue with the usable clips only?\n"
+                    "Choose No to ask Gemini again and paste a new answer.",
+                    parent=parent):
+                return clips, None
+            return None, "\n".join(problems[:5])
+
+        self.set_status("Waiting for Gemini JSON from you…")
+        clips = self.ask("manual_ai", reason=reason or "Gemini could not be used.", folder=folder,
+                         prompt=prompt, validator=validator)
+        if not clips:
+            raise UserFacingError("No clips were provided, so the job was stopped.")
+        return clips
+
+    # review ---------------------------------------------------------------
+    def step_review(self, job):
+        waiter = Waiter()
+        self.review_waiter = waiter
+        self.events.put(("state", "review"))
+        self.set_status("Review the clips, untick any you do not want, then press 'Create selected clips'.")
+        self.log("Waiting for you to review the clips.")
+        return self.wait_for(waiter)
+
+    # steps 4 and 5 ---------------------------------------------------------
+    def step_download_and_cut(self, job, title, clips):
+        self.events.put(("state", "running"))
+        self.set_step(3, "active")
+        self.set_status("Downloading video…")
+        self.log("Starting video download.")
+        video_path, dl_info = download_video(
+            job.url, job.quality, self.log, self.set_status, self.set_progress, job.cancel)
+        self.log(f"Video ready: {video_path.name}", "ok")
+        self.set_step(3, "done")
+        self.set_progress(70)
+
+        try:
+            true_duration = probe_duration(video_path, job.cancel)
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            self.log(f"Could not measure the video length ({exc}). Using the length from YouTube.", "warn")
+            true_duration = float(dl_info.get("duration") or 0) or None
+
+        # Map clip -> its card index (cards were built from the full list)
+        index_by_rank = {card.clip.rank: i for i, card in enumerate(self.cards)}
+        if true_duration:
+            fitted, dropped = fit_to_duration(clips, true_duration)
+            for clip in dropped:
+                self.log(f"Skipped '{clip.title}': it is outside the video length.", "warn")
+                self.events.put(("clip_status", (index_by_rank.get(clip.rank, 0), "Skipped (outside video)",
+                                                 WARN, None)))
+            clips = fitted
+        if not clips:
+            raise UserFacingError("None of the clips fit inside the downloaded video.")
+
+        self.set_step(4, "active")
+        folder = OUTPUT_DIR / safe_name(title, 80)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise UserFacingError(f"Cannot create the output folder:\n{folder}\n{exc}")
+
+        ok = failed = 0
+        for position, clip in enumerate(clips, 1):
+            if job.cancel.is_set():
+                raise JobCancelled()
+            card_index = index_by_rank.get(clip.rank, position - 1)
+            clip_title = safe_name(clip.title, 70)
+            out_path = unique_path(folder / f"{clip.rank:02d}_{clip_title}.mp4")
+            self.set_status(f"Creating clip {position} of {len(clips)}: {clip.title}")
+            self.events.put(("clip_status", (card_index, "Creating…", ACCENT, None)))
+            self.log(f"[{position}/{len(clips)}] {clip.title} ({clip.start:.1f}s to {clip.end:.1f}s)")
+            try:
+                cut_clip(video_path, out_path, clip.start, clip.end, job.ratio, job.cancel)
+                ok += 1
+                self.log(f"  Saved {out_path.name}", "ok")
+                self.events.put(("clip_status", (card_index, "Saved", GOOD, out_path)))
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                failed += 1
+                self.log(f"  Failed: {exc}", "error")
+                self.events.put(("clip_status", (card_index, f"Failed: {exc}"[:90], BAD, None)))
+                try:
+                    out_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self.set_progress(70 + position / len(clips) * 30)
+
+        self.set_step(4, "done")
+        self.set_status("Completed")
+        return folder, ok, failed
 
 
 def main():
-    root = tk.Tk()
-    try:
-        style = ttk.Style()
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-    except Exception:
-        pass
-    ViralClipsApp(root)
-    root.mainloop()
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+    app = ViralClipsApp()
+    app.mainloop()
 
 
 if __name__ == "__main__":
