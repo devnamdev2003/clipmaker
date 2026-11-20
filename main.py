@@ -13,6 +13,12 @@ YouTube (nothing is downloaded yet). For every clip you set start/end time and o
 then press "Generate clips" - only then is the video downloaded and the clips are cut.
 (Optional: pip install pywebview  ->  the editor opens in its own window instead of the browser.)
 
+New in this version:
+  * Crop frame you can move: set width/height for a clip, then DRAG the frame on the video to choose
+    which part is kept (or press "Center"). FFmpeg crops exactly that part.
+  * "Title & hashtags" button on every clip card: Gemini writes a YouTube title, YouTube description,
+    Instagram caption and hashtags from what is said in the clip. Copy buttons for each part.
+
 Install once:
     pip install customtkinter yt-dlp python-dotenv google-genai
 Also needs FFmpeg + ffprobe on PATH.
@@ -39,7 +45,7 @@ import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -201,6 +207,8 @@ class Clip:
     start: float
     end: float
     size: object = SIZE_DEFAULT  # SIZE_DEFAULT | None (original) | (width, height)
+    crop_x: float = 0.5  # where the crop frame sits: 0 = far left, 0.5 = centre, 1 = far right
+    crop_y: float = 0.5  # 0 = top, 0.5 = centre, 1 = bottom
 
     @property
     def length(self):
@@ -642,7 +650,7 @@ def fit_to_duration(clips, duration):
         if end - clip.start < 1:
             dropped.append(clip)
             continue
-        kept.append(Clip(clip.rank, clip.title, clip.description, clip.start, end, clip.size))
+        kept.append(replace(clip, end=end))
     return kept, dropped
 
 
@@ -852,21 +860,34 @@ def run_process(cmd, cancel=None, timeout=None):
                 raise RuntimeError("A tool took too long and was stopped.")
 
 
-def make_video_filter(output_size):
+def clamp01(value, default=0.5):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:  # NaN
+        return default
+    return min(1.0, max(0.0, number))
+
+
+def make_video_filter(output_size, crop_x=0.5, crop_y=0.5):
+    """Scale the video so it fills the output size, then crop the part the user chose in the editor."""
     if output_size is None:
         return None
     width, height = output_size
-    return f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1"
+    cx, cy = clamp01(crop_x), clamp01(crop_y)
+    return (f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height}:(in_w-out_w)*{cx:.4f}:(in_h-out_h)*{cy:.4f},setsar=1")
 
 
-def cut_clip(source_path, output_path, start, end, output_size, cancel):
+def cut_clip(source_path, output_path, start, end, output_size, cancel, crop_x=0.5, crop_y=0.5):
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-ss", f"{start:.3f}", "-i", str(source_path),
         "-t", f"{end - start:.3f}",
         "-map", "0:v:0", "-map", "0:a:0?",
     ]
-    video_filter = make_video_filter(output_size)
+    video_filter = make_video_filter(output_size, crop_x, crop_y)
     if video_filter:
         command.extend(["-vf", video_filter])
     command.extend([
@@ -881,12 +902,12 @@ def cut_clip(source_path, output_path, start, end, output_size, cancel):
         raise RuntimeError("FFmpeg produced an empty file")
 
 
-def call_gemini(prompt):
+def call_gemini(prompt, temperature=0.25):
     client = genai.Client(api_key=Config.api_key, http_options=types.HttpOptions(timeout=180_000))
     response = client.models.generate_content(
         model=Config.model,
         contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.25),
+        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=temperature),
     )
     try:
         text = (response.text or "").strip()
@@ -898,12 +919,122 @@ def call_gemini(prompt):
 
 
 # --------------------------------------------------------------------------- #
+# Post copy: title, caption and hashtags for Instagram / YouTube
+# --------------------------------------------------------------------------- #
+_TS_LINE = re.compile(r"^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*(.*)$")
+YT_TITLE_MAX = 100
+YT_HASHTAG_MAX = 5
+IG_HASHTAG_MAX = 12
+
+
+def transcript_excerpt(transcript_text, start, end, max_chars=4000):
+    """The words spoken between start and end, taken from the '[mm:ss] text' transcript."""
+    words = []
+    for line in (transcript_text or "").splitlines():
+        match = _TS_LINE.match(line.strip())
+        if not match:
+            continue
+        try:
+            moment = parse_time_value(match.group(1))
+        except ValueError:
+            continue
+        if start - 1 <= moment <= end:
+            words.append(match.group(2))
+    return " ".join(words).strip()[:max_chars]
+
+
+def build_social_prompt(video_title, clip, excerpt):
+    spoken = excerpt or "(No transcript text was found for this part. Use the clip title and description only.)"
+    return f"""You are a social media manager who writes posts for short vertical videos
+(YouTube Shorts and Instagram Reels). Write the post copy for ONE clip.
+
+ORIGINAL VIDEO TITLE: {video_title}
+CLIP TITLE: {clip.title}
+CLIP DESCRIPTION: {clip.description or "-"}
+CLIP LENGTH: {clip.length:.0f} seconds
+WHAT IS SAID IN THE CLIP:
+{spoken}
+
+Rules:
+- Base everything on what is really said or shown. Do not invent facts, names, numbers or quotes.
+- Write in the same language and script as the spoken words above (hashtags may mix in English).
+- youtube_title: at most 80 characters, a strong hook, honest (no fake clickbait), no hashtags, at most one emoji.
+- youtube_description: 1 or 2 short sentences about the clip, then a short call to subscribe. No hashtags in it.
+- youtube_hashtags: 4 or 5 relevant hashtags (do not include #Shorts, it is added automatically).
+- instagram_caption: a hook on the first line, then 1 to 3 short lines, at most two emojis,
+  ending with a question or a call to comment/follow. No hashtags in the text.
+- instagram_hashtags: 8 to 12 hashtags, a mix of broad and niche ones.
+- Hashtags have no spaces.
+- Return ONLY valid JSON, with no Markdown fences and no commentary, in exactly this structure:
+
+{{
+  "youtube_title": "",
+  "youtube_description": "",
+  "youtube_hashtags": ["#example"],
+  "instagram_caption": "",
+  "instagram_hashtags": ["#example"]
+}}
+"""
+
+
+def extract_json_object(text):
+    text = (text or "").strip()
+    text = re.sub(r"^```(?:json|JSON)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    decoder = json.JSONDecoder()
+    for index, ch in enumerate(text):
+        if ch == "{":
+            try:
+                obj, _ = decoder.raw_decode(text[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                return obj
+    raise ValueError("no JSON answer was found in the text")
+
+
+def clean_hashtags(value, limit):
+    if isinstance(value, str):
+        value = re.split(r"[\s,]+", value)
+    if not isinstance(value, (list, tuple)):
+        return []
+    tags, seen = [], set()
+    for item in value:
+        word = re.sub(r"\W+", "", str(item))
+        if len(word) < 2 or word.isdigit() or word.lower() in seen:
+            continue
+        seen.add(word.lower())
+        tags.append("#" + word)
+        if len(tags) >= limit:
+            break
+    return tags
+
+
+def parse_social_copy(text):
+    data = extract_json_object(text)
+    title = " ".join(str(data.get("youtube_title") or "").split())[:YT_TITLE_MAX].strip()
+    if not title:
+        raise ValueError("the answer has no youtube_title")
+    yt_tags = [t for t in clean_hashtags(data.get("youtube_hashtags"), YT_HASHTAG_MAX)
+               if t.lower() != "#shorts"][:YT_HASHTAG_MAX - 1]
+    return {
+        "youtube_title": title,
+        "youtube_description": str(data.get("youtube_description") or "").strip(),
+        "youtube_hashtags": ["#Shorts"] + yt_tags,
+        "instagram_caption": str(data.get("instagram_caption") or "").strip(),
+        "instagram_hashtags": clean_hashtags(data.get("instagram_hashtags"), IG_HASHTAG_MAX),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Clip editor (watch the video from YouTube, set time + size for every clip)
 # --------------------------------------------------------------------------- #
 def clip_summary(clip):
     text = f"{format_timestamp(clip.start)} to {format_timestamp(clip.end)}, {clip.length:.0f} seconds"
     if clip.size != SIZE_DEFAULT:
         text += f", {clip.size[0]}×{clip.size[1]}" if clip.size else ", original size"
+        if clip.size and (abs(clip.crop_x - 0.5) > 0.005 or abs(clip.crop_y - 0.5) > 0.005):
+            text += f", frame at {clip.crop_x * 100:.0f}% / {clip.crop_y * 100:.0f}%"
     return text
 
 
@@ -931,6 +1062,7 @@ class EditorSession:
                 "rank": clip.rank, "title": clip.title, "description": clip.description,
                 "start": round(clip.start, 2), "end": round(clip.end, 2),
                 "width": size[0] if size else None, "height": size[1] if size else None,
+                "crop_x": clip.crop_x, "crop_y": clip.crop_y,
             })
         return {
             "video_id": self.video_id, "title": self.title, "duration": self.duration,
@@ -956,8 +1088,13 @@ main{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(380px,1fr);gap:18
 .stage{position:sticky;top:14px;align-self:start}
 .player-box{position:relative;aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden;border:1px solid var(--line)}
 #player,#player iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
-#crop{position:absolute;pointer-events:none;border:2px solid var(--accent);border-radius:3px;
+#crop{position:absolute;pointer-events:auto;cursor:grab;touch-action:none;border:2px solid var(--accent);border-radius:3px;
 box-shadow:0 0 0 9999px rgba(10,12,16,.62);display:none}
+#crop.drag{cursor:grabbing}
+#crop::after{content:"✥ drag to move";position:absolute;left:50%;top:6px;transform:translateX(-50%);font-size:11px;color:#fff;
+background:rgba(0,0,0,.6);padding:2px 9px;border-radius:10px;white-space:nowrap;pointer-events:none}
+.scrubrow{display:flex;gap:10px;align-items:center;margin-top:10px}
+.scrubrow input[type=range]{flex:1;accent-color:var(--accent);padding:0}
 .under{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:10px;color:var(--soft);font-size:13px;flex-wrap:wrap}
 .under label{display:flex;gap:6px;align-items:center;cursor:pointer}
 #now{font-variant-numeric:tabular-nums}
@@ -1001,12 +1138,14 @@ padding:12px 24px;display:flex;align-items:center;gap:16px;justify-content:space
  <section class="stage">
   <div class="player-box"><div id="player"></div><div id="crop"></div></div>
   <div class="banner" id="banner"></div>
+  <div class="scrubrow"><button id="pp">⏯ Play / Pause</button><input type="range" id="scrub" min="0" max="1000" value="0"></div>
   <div class="under">
    <span>Now: <b id="now">00:00.0</b> / <span id="total">--:--</span></span>
    <label><input type="checkbox" id="showcrop" checked> Show the crop frame of the selected clip</label>
   </div>
   <div class="hint">Pause on the exact frame, then press <b>Set = now</b> on a clip. Click a clip to select it and see its crop frame.
-  Width and height must be even numbers; the video is scaled to fill the frame and cropped from the centre.</div>
+  <b>Drag the bright frame on the video to move it</b> and choose which part is kept (use the Center button to reset).
+  Width and height must be even numbers; the video is scaled to fill the frame and the part inside your frame is cut out.</div>
  </section>
  <section id="list"></section>
 </main>
@@ -1020,7 +1159,7 @@ padding:12px 24px;display:flex;align-items:center;gap:16px;justify-content:space
 <script>
 const D=JSON.parse(document.getElementById('data').textContent);
 const $=s=>document.querySelector(s);
-const clips=D.clips.map(c=>({...c,enabled:true}));
+const clips=D.clips.map(c=>({...c,enabled:true,cx:c.crop_x==null?.5:c.crop_x,cy:c.crop_y==null?.5:c.crop_y}));
 let active=0,player=null,ready=false,stopAt=null,duration=D.duration||0;
 const PRESETS=[["Original size",null,null],["Vertical 9:16 (1080×1920)",1080,1920],["Horizontal 16:9 (1920×1080)",1920,1080],
 ["Square 1:1 (1080×1080)",1080,1080],["Portrait 4:5 (1080×1350)",1080,1350],["Custom size",0,0]];
@@ -1046,6 +1185,8 @@ function cardHTML(c,i){
  <div class="row"><span class="lab">Size</span><select class="preset">${PRESETS.map((p,k)=>`<option value="${k}">${p[0]}</option>`).join('')}</select>
   <input class="n" type="number" min="100" max="4096" step="2" data-f="width" placeholder="width"> ×
   <input class="n" type="number" min="100" max="4096" step="2" data-f="height" placeholder="height"></div>
+ <div class="row"><span class="lab">Frame</span><button class="mini" data-act="center">⌖ Center</button><span class="pos"></span>
+  <span class="sub">drag the frame on the video to move it</span></div>
  <div class="len"></div><div class="err"></div></div>`}
 
 function validate(c){
@@ -1061,6 +1202,7 @@ function sync(i){
  set('[data-f=start]',fmt(c.start));set('[data-f=end]',fmt(c.end));
  set('[data-f=width]',c.width||'');set('[data-f=height]',c.height||'');
  el.querySelector('.preset').value=presetIndex(c);
+ el.querySelector('.pos').textContent=c.width?`X ${Math.round(c.cx*100)}% · Y ${Math.round(c.cy*100)}%`:'(set a size first)';
  const bar=el.querySelector('.bar i'),d=duration||Math.max(c.end,1);
  bar.style.left=Math.min(100,c.start/d*100)+'%';bar.style.width=Math.max(0.6,Math.min(100-c.start/d*100,(c.end-c.start)/d*100))+'%';
  el.querySelector('.len').textContent=`Length ${Math.max(0,c.end-c.start).toFixed(1)} s`+(c.width?`  ·  output ${c.width}×${c.height}`:'  ·  original size');
@@ -1068,11 +1210,13 @@ function sync(i){
  el.classList.toggle('off',!c.enabled);
  if(i===active)overlay()}
 
+function frameBox(c){const sa=16/9,oa=c.width/c.height;let w=1,h=1;if(oa<sa)w=oa/sa;else h=sa/oa;return{w,h}}
 function overlay(){
  const c=clips[active],el=$('#crop');
  if(!c||!$('#showcrop').checked||!c.width||!c.height){el.style.display='none';return}
- const sa=16/9,oa=c.width/c.height;let w=1,h=1;if(oa<sa)w=oa/sa;else h=sa/oa;
- Object.assign(el.style,{display:'block',width:w*100+'%',height:h*100+'%',left:(1-w)/2*100+'%',top:(1-h)/2*100+'%'})}
+ const {w,h}=frameBox(c);
+ Object.assign(el.style,{display:'block',width:w*100+'%',height:h*100+'%',left:(1-w)*c.cx*100+'%',top:(1-h)*c.cy*100+'%'})}
+const clamp01=v=>Math.min(1,Math.max(0,v));
 
 function select(i){active=i;document.querySelectorAll('.card').forEach(n=>n.classList.toggle('active',+n.dataset.i===i));overlay()}
 function seek(t){if(ready){player.seekTo(Math.max(0,t),true);player.pauseVideo();stopAt=null}}
@@ -1090,7 +1234,8 @@ $('#list').addEventListener('click',e=>{
  if(a==='play'&&ready){player.seekTo(c.start,true);player.playVideo();stopAt=c.end}
  else if(a==='now'&&ready)setTime(i,b.dataset.w,player.getCurrentTime());
  else if(a==='s')setTime(i,'start',c.start+ +b.dataset.d);
- else if(a==='e')setTime(i,'end',c.end+ +b.dataset.d)});
+ else if(a==='e')setTime(i,'end',c.end+ +b.dataset.d)
+ else if(a==='center'){c.cx=.5;c.cy=.5;sync(i)}});
 $('#list').addEventListener('change',e=>{
  const card=e.target.closest('.card');if(!card)return;const i=+card.dataset.i,c=clips[i],t=e.target;
  if(t.classList.contains('en')){c.enabled=t.checked;sync(i)}
@@ -1101,6 +1246,23 @@ $('#list').addEventListener('change',e=>{
   if(!c.width&&!c.height){c.width=c.height=null}sync(i)}});
 $('#showcrop').addEventListener('change',overlay);
 
+(function(){
+ const el=$('#crop'),box=document.querySelector('.player-box');let drag=null;
+ el.addEventListener('pointerdown',e=>{const c=clips[active];if(!c||!c.width)return;
+  drag={x:e.clientX,y:e.clientY,cx:c.cx,cy:c.cy,r:box.getBoundingClientRect(),b:frameBox(c)};
+  el.setPointerCapture(e.pointerId);el.classList.add('drag');e.preventDefault()});
+ el.addEventListener('pointermove',e=>{if(!drag)return;const c=clips[active];
+  if(drag.b.w<.999)c.cx=clamp01(drag.cx+(e.clientX-drag.x)/(drag.r.width*(1-drag.b.w)));
+  if(drag.b.h<.999)c.cy=clamp01(drag.cy+(e.clientY-drag.y)/(drag.r.height*(1-drag.b.h)));
+  sync(active)});
+ const end=()=>{drag=null;el.classList.remove('drag')};
+ el.addEventListener('pointerup',end);el.addEventListener('pointercancel',end);
+})();
+let scrubbing=false;const scrub=$('#scrub');
+$('#pp').addEventListener('click',()=>{if(!ready)return;if(player.getPlayerState()===1)player.pauseVideo();else player.playVideo()});
+scrub.addEventListener('input',()=>{scrubbing=true;if(ready&&duration){player.seekTo(scrub.value/1000*duration,true);stopAt=null}});
+scrub.addEventListener('change',()=>{scrubbing=false});
+
 function banner(text){const b=$('#banner');b.textContent=text;b.style.display='block'}
 if(D.embeddable===false)banner('YouTube does not allow this video to be played outside youtube.com, so the preview may stay black. You can still type the start and end times by hand.');
 window.onYouTubeIframeAPIReady=()=>{player=new YT.Player('player',{videoId:D.video_id,host:'https://www.youtube.com',
@@ -1109,13 +1271,14 @@ window.onYouTubeIframeAPIReady=()=>{player=new YT.Player('player',{videoId:D.vid
  onError:()=>banner('The video could not be played here (embedding blocked or video unavailable). You can still type the times by hand.')}})};
 const s=document.createElement('script');s.src='https://www.youtube.com/iframe_api';document.head.appendChild(s);
 setInterval(()=>{if(!ready)return;const t=player.getCurrentTime();$('#now').textContent=fmt(t);
+ if(!scrubbing&&duration)scrub.value=Math.round(Math.min(1,t/duration)*1000);
  if(stopAt!==null&&t>=stopAt){player.pauseVideo();stopAt=null}},120);
 
 function msg(t,bad){const m=$('#msg');m.textContent=t;m.className=bad?'bad':''}
 $('#gen').addEventListener('click',async()=>{
  const out=[];let bad='';
  clips.forEach(c=>{if(!c.enabled)return;const e=validate(c);if(e&&!bad)bad=`Clip #${c.rank}: ${e}.`;
-  out.push({rank:c.rank,title:c.title,description:c.description,start:c.start,end:c.end,width:c.width||null,height:c.height||null})});
+  out.push({rank:c.rank,title:c.title,description:c.description,start:c.start,end:c.end,width:c.width||null,height:c.height||null,crop_x:c.cx,crop_y:c.cy})});
  if(bad)return msg(bad,true);
  if(!out.length)return msg('Tick at least one clip.',true);
  const btn=$('#gen');btn.disabled=true;msg('Sending to the app…');
@@ -1510,11 +1673,243 @@ class SettingsDialog(ModalBase):
         self.close(True)
 
 
+class PostCopyDialog(ModalBase):
+    """Gemini writes the title, caption and hashtags of one clip, ready to paste into YouTube and Instagram."""
+
+    def __init__(self, parent, card, context, on_done):
+        super().__init__(parent, "Title & hashtags for your post", 780, 900, on_done, resizable=True)
+        self.card = card
+        self.context = context
+        self.copy = card.post_copy
+        self.results = queue.Queue()
+        self.busy = False
+        self.link_var = tk.BooleanVar(value=True)
+        clip = card.clip
+        excerpt = transcript_excerpt(context.get("transcript"), clip.start, clip.end)
+        self.prompt = build_social_prompt(context.get("title", ""), clip, excerpt)
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(3, weight=1)
+
+        head = ctk.CTkFrame(self, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=24, pady=(18, 0))
+        ctk.CTkLabel(head, text=f"Post copy for clip #{clip.rank}", font=font(20, "bold"),
+                     text_color=TEXT, anchor="w").pack(anchor="w")
+        ctk.CTkLabel(head, text=clip.title, font=font(13), text_color=SOFT, anchor="w", justify="left",
+                     wraplength=720).pack(anchor="w", pady=(2, 0))
+
+        frame = self._section(1, "YouTube title", lambda b: self._copy_text(self.read(self.yt_title), b))
+        self.yt_title = ctk.CTkEntry(frame, fg_color=PANEL, text_color=TEXT, border_color=LINE, font=font(14), height=36)
+        self.yt_title.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+
+        frame = self._section(2, "YouTube description (with hashtags)",
+                              lambda b: self._copy_text(self.read(self.yt_desc), b), grow=True)
+        self.yt_desc = self._textbox(frame)
+
+        frame = self._section(3, "Instagram caption (with hashtags)",
+                              lambda b: self._copy_text(self.read(self.ig_box), b), grow=True)
+        self.ig_box = self._textbox(frame)
+
+        options = ctk.CTkFrame(self, fg_color="transparent")
+        options.grid(row=4, column=0, sticky="ew", padx=24, pady=(10, 0))
+        ctk.CTkCheckBox(options, text="Add the link of the full video to the YouTube description",
+                        variable=self.link_var, command=self.refresh_description, font=font(12), text_color=SOFT,
+                        fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=MUTED).pack(anchor="w")
+
+        self.status = ctk.CTkLabel(self, text="", anchor="w", justify="left", wraplength=720, font=font(13),
+                                   text_color=MUTED)
+        self.status.grid(row=5, column=0, sticky="ew", padx=26, pady=(8, 0))
+
+        self.fallback = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=10)
+        self.fallback.grid(row=6, column=0, sticky="ew", padx=24, pady=(8, 0))
+        ctk.CTkLabel(self.fallback, text="Or use the Gemini chat website:", font=font(12), text_color=SOFT).pack(
+            side="left", padx=(14, 8), pady=10)
+        self.prompt_button = quiet_button(self.fallback, "Copy prompt", None, width=110, height=30)
+        self.prompt_button.configure(command=lambda: self.copy_to_clipboard(self.prompt, self.prompt_button, "Copy prompt"))
+        self.prompt_button.pack(side="left", padx=4)
+        quiet_button(self.fallback, "Open Gemini", lambda: webbrowser.open(GEMINI_URL), width=110, height=30).pack(
+            side="left", padx=4)
+        quiet_button(self.fallback, "Paste answer", self.paste_answer, width=110, height=30).pack(side="left", padx=4)
+        self.fallback.grid_remove()
+
+        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons.grid(row=7, column=0, sticky="ew", padx=24, pady=(10, 20))
+        self.regen_button = quiet_button(buttons, "Write new version", lambda: self.generate(creative=True), width=150)
+        self.regen_button.pack(side="left")
+        quiet_button(buttons, "Save as .txt", self.save_txt, width=110).pack(side="left", padx=8)
+        primary_button(buttons, "Copy everything", self.copy_everything, width=150).pack(side="right")
+        self.all_button = buttons.winfo_children()[-1]
+
+        self.after(250, self.start)
+        self.after(150, self.poll)
+
+    # layout helpers -------------------------------------------------------
+    def _section(self, row, label, copy_command, grow=False):
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.grid(row=row, column=0, sticky="nsew", padx=24, pady=(12, 0))
+        frame.grid_columnconfigure(0, weight=1)
+        if grow:
+            frame.grid_rowconfigure(1, weight=1)
+        field_label(frame, label).grid(row=0, column=0, sticky="w")
+        button = quiet_button(frame, "Copy", None, width=80, height=28)
+        button.configure(command=lambda b=button: copy_command(b))
+        button.grid(row=0, column=1, sticky="e")
+        return frame
+
+    def _textbox(self, frame):
+        box = ctk.CTkTextbox(frame, fg_color=PANEL, text_color=TEXT, font=font(13), border_width=1,
+                             border_color=LINE, wrap="word", height=120)
+        box.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
+        return box
+
+    @staticmethod
+    def read(widget):
+        if isinstance(widget, ctk.CTkEntry):
+            return widget.get().strip()
+        return widget.get("1.0", "end").strip()
+
+    @staticmethod
+    def write(widget, text):
+        if isinstance(widget, ctk.CTkEntry):
+            widget.delete(0, "end")
+            widget.insert(0, text)
+        else:
+            widget.delete("1.0", "end")
+            widget.insert("1.0", text)
+
+    def _copy_text(self, text, button):
+        if text:
+            self.copy_to_clipboard(text, button)
+
+    # content --------------------------------------------------------------
+    def description_text(self):
+        copy = self.copy or {}
+        parts = [copy.get("youtube_description", "")]
+        if self.link_var.get() and self.context.get("url"):
+            parts.append(f"Full video: {self.context['url']}")
+        if copy.get("youtube_hashtags"):
+            parts.append(" ".join(copy["youtube_hashtags"]))
+        return "\n\n".join(p for p in parts if p)
+
+    def instagram_text(self):
+        copy = self.copy or {}
+        parts = [copy.get("instagram_caption", "")]
+        if copy.get("instagram_hashtags"):
+            parts.append(" ".join(copy["instagram_hashtags"]))
+        return "\n\n".join(p for p in parts if p)
+
+    def refresh_description(self):
+        if self.copy:
+            self.write(self.yt_desc, self.description_text())
+
+    def fill(self, copy):
+        self.copy = copy
+        self.card.post_copy = copy
+        self.write(self.yt_title, copy["youtube_title"])
+        self.write(self.yt_desc, self.description_text())
+        self.write(self.ig_box, self.instagram_text())
+        self.fallback.grid_remove()
+        self.status.configure(text="Ready. You can edit anything, then press Copy.", text_color=GOOD)
+
+    def all_text(self):
+        return (f"YOUTUBE TITLE\n{self.read(self.yt_title)}\n\n"
+                f"YOUTUBE DESCRIPTION\n{self.read(self.yt_desc)}\n\n"
+                f"INSTAGRAM CAPTION\n{self.read(self.ig_box)}\n")
+
+    def copy_everything(self):
+        self.copy_to_clipboard(self.all_text(), self.all_button, "Copy everything")
+
+    def show_error(self, text):
+        self.status.configure(text=text, text_color=BAD)
+        self.fallback.grid()
+
+    # actions --------------------------------------------------------------
+    def start(self):
+        if self._closed:
+            return
+        if self.copy:
+            self.fill(self.copy)
+        else:
+            self.generate()
+
+    def generate(self, creative=False):
+        if self.busy:
+            return
+        if not Config.api_key:
+            self.show_error("No Gemini API key is set. Add it in Settings, or use the Gemini chat website below.")
+            return
+        self.busy = True
+        self.regen_button.configure(state="disabled")
+        self.status.configure(text="Gemini is writing the post…", text_color=ACCENT)
+        temperature = 1.0 if creative else 0.7
+        prompt = self.prompt
+
+        def work():
+            last = None
+            for attempt in range(2):
+                try:
+                    self.results.put(("ok", parse_social_copy(call_gemini(prompt, temperature))))
+                    return
+                except Exception as exc:
+                    last = exc
+                    if is_fatal_ai_error(exc):
+                        break
+                    time.sleep(2)
+            self.results.put(("error", f"Gemini could not write the post. {friendly_error(last)}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def poll(self):
+        if self._closed:
+            return
+        try:
+            while True:
+                kind, value = self.results.get_nowait()
+                self.busy = False
+                self.regen_button.configure(state="normal")
+                if kind == "ok":
+                    self.fill(value)
+                else:
+                    self.show_error(value)
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return
+        self.after(150, self.poll)
+
+    def paste_answer(self):
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            self.show_error("The clipboard is empty. Copy Gemini's answer first.")
+            return
+        try:
+            self.fill(parse_social_copy(text))
+        except ValueError as exc:
+            self.show_error(f"That text could not be used: {exc}.")
+
+    def save_txt(self):
+        path = self.card.output_path
+        if not path:
+            self.status.configure(text="Create the clip first. Then the text file is saved next to the video.",
+                                  text_color=WARN)
+            return
+        target = Path(path).with_suffix(".txt")
+        try:
+            target.write_text(self.all_text(), encoding="utf-8")
+        except OSError as exc:
+            self.show_error(f"Could not save the file: {exc}")
+            return
+        self.status.configure(text=f"Saved {target.name} next to the video.", text_color=GOOD)
+
+
 class ClipCard(ctk.CTkFrame):
-    def __init__(self, parent, clip):
+    def __init__(self, parent, clip, on_post=None):
         super().__init__(parent, fg_color=PANEL, corner_radius=12, border_width=1, border_color=LINE)
         self.clip = clip
         self.output_path = None
+        self.post_copy = None
         self._wrap = 0
         self.var = tk.BooleanVar(value=True)
         self.grid_columnconfigure(2, weight=1)
@@ -1543,6 +1938,9 @@ class ClipCard(ctk.CTkFrame):
         self.open_button = quiet_button(self, "Show file", self.show_file, width=90, height=28)
         self.open_button.grid(row=3, column=3, padx=(0, 14), pady=(6, 12))
         self.open_button.grid_remove()
+        if on_post:
+            quiet_button(self, "Title & hashtags", lambda: on_post(self), width=140, height=30).grid(
+                row=0, column=3, rowspan=2, padx=(0, 14), pady=(12, 0), sticky="ne")
         self.bind("<Configure>", self._resize)
 
     def _resize(self, event):
@@ -1589,6 +1987,8 @@ class ViralClipsApp(ctk.CTk):
         self.editor_session = None
         self.editor_server = None
         self.active_dialog = None
+        self.post_dialog = None
+        self.post_context = None  # video title, link and transcript for the post copy
         self.last_output_folder = None
         self._alive = True
         self._step_index = None
@@ -1923,7 +2323,8 @@ class ViralClipsApp(ctk.CTk):
                     raise ValueError(f"Clip #{rank}: width and height must be between 100 and 4096.")
                 size = (width - width % 2, height - height % 2)  # H.264 needs even sizes
             title = str(item.get("title") or f"Clip {rank}").strip()[:200]
-            clips.append(Clip(rank, title, str(item.get("description") or "").strip(), start, end, size))
+            clips.append(Clip(rank, title, str(item.get("description") or "").strip(), start, end, size,
+                              clamp01(item.get("crop_x")), clamp01(item.get("crop_y"))))
         waiter = self.review_waiter
         if waiter is None or self.app_state != "review":
             raise ValueError("The app is not waiting for clips right now.")
@@ -1966,6 +2367,7 @@ class ViralClipsApp(ctk.CTk):
         self.url_entry.focus_set()
 
     def clear_results(self):
+        self.post_context = None
         for card in self.cards:
             card.destroy()
         self.cards = []
@@ -2011,10 +2413,28 @@ class ViralClipsApp(ctk.CTk):
         self.cards = []
         self.empty_label.grid_remove()
         for i, clip in enumerate(clips):
-            card = ClipCard(self.clips_frame, clip)
+            card = ClipCard(self.clips_frame, clip, on_post=self.open_post_copy)
             card.grid(row=i, column=0, sticky="ew", pady=(0, 10), padx=(0, 6))
             self.cards.append(card)
         self.tabs.set("Clips")
+
+    def open_post_copy(self, card):
+        if not self.post_context:
+            messagebox.showinfo("Not ready", "The video information is not ready yet. Try again in a moment.")
+            return
+        if self.post_dialog is not None:
+            try:
+                self.post_dialog.lift()
+                self.post_dialog.focus_force()
+            except tk.TclError:
+                self.post_dialog = None
+            else:
+                return
+
+        def done(_value):
+            self.post_dialog = None
+
+        self.post_dialog = PostCopyDialog(self, card, self.post_context, done)
 
     def open_dialog(self, kind, payload, waiter):
         def finish(value):
@@ -2095,6 +2515,7 @@ class ViralClipsApp(ctk.CTk):
         try:
             title, duration, transcript_text, info = self.step_info(job)
             transcript_text = self.step_transcript(job, info)
+            self.post_context = {"title": title, "url": job.url, "transcript": transcript_text}
             clips = self.step_ai(job, info, title, duration, transcript_text)
             if not job.auto_create:
                 answer = self.step_review(job, info, title, duration, clips)
@@ -2380,7 +2801,7 @@ class ViralClipsApp(ctk.CTk):
             self.log(f"[{position}/{len(clips)}] {clip.title} ({clip.start:.1f}s to {clip.end:.1f}s)")
             try:
                 cut_clip(video_path, out_path, clip.start, clip.end,
-                         clip_output_size(clip, job.ratio), job.cancel)
+                         clip_output_size(clip, job.ratio), job.cancel, clip.crop_x, clip.crop_y)
                 ok += 1
                 self.log(f"  Saved {out_path.name}", "ok")
                 self.events.put(("clip_status", (card_index, "Saved", GOOD, out_path)))
