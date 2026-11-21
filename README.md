@@ -18,6 +18,7 @@ Turn any long YouTube video into **5 ready-to-post short clips** for YouTube Sho
   - Switch to **Split: top + bottom** to stack two different parts of the video (e.g., speaker + screen/reaction) into one vertical clip with independent zoom, framing, and adjustable split height.
 - **Text Overlays (English, Hindi & Emojis):** Add up to 10 styled text layers per clip with custom fonts, outlines, rounded background boxes, timing (`from` / `to` seconds), and drag-and-drop placement on the live output preview.
 - **YouTube Upload tab (step 6):** Nothing is uploaded automatically. When your clips are ready they are listed in the **Upload** tab (also the 6th step above the tabs). Review or edit each clip's title and description, choose private / unlisted / public, then press **Upload to YouTube**. The tab has its own **Upload log** (also mirrored into the Log tab), a setup check, and can load any folder of `.mp4` clips later. Already-uploaded clips are never uploaded twice. All upload code lives in `youtube_uploader.py`.
+- **Instagram Reels upload (new):** The **Instagram** tab posts your clips to Instagram as Reels using the official Instagram Graph API (the file is sent straight from your computer). Captions come from the Gemini post copy, already-posted clips are never posted twice, and an optional switch posts automatically as soon as the YouTube upload has finished. Reels are public immediately. All code lives in `instagram_uploader.py`; setup is in `INSTAGRAM_SETUP.md`.
 - **Works on small screens:** the left settings panel, the Upload tab and the Clip Editor's video panel all scroll, the step bar and buttons wrap, and dialogs are resizable and never taller than your screen.
 - **Auto-Generated Post Copy:** Writes YouTube titles, descriptions, hashtags, and Instagram captions for all clips in a single Gemini call, with one-click Copy buttons and automatic saving to `posts.txt`.
 
@@ -114,6 +115,23 @@ The first time you upload, a browser window opens so you can sign in and allow t
 
 > Uploads are **private** by default. Change the visibility in the upload window or with `YOUTUBE_PRIVACY` in `.env`. Check the **Quotas** page in your Cloud Console for your daily upload limit.
 
+### 7. Optional: Set Up Instagram Upload (one time)
+
+Skip this if you do not want Instagram. You need an Instagram Business/Creator account linked to a Facebook Page, a Meta developer app, a long-lived access token and your Instagram user id. The full step-by-step guide is in **[INSTAGRAM_SETUP.md](INSTAGRAM_SETUP.md)**. In short:
+
+```bash
+pip install requests          # already included in requirements.txt
+```
+
+```env
+INSTAGRAM_ACCESS_TOKEN=your_long_lived_token
+INSTAGRAM_USER_ID=17841xxxxxxxxxxxxx
+```
+
+Then open the **Instagram** tab and press **Test connection** (or run `python instagram_uploader.py --check`). Tick **Post automatically after the YouTube upload** to post to both in one go.
+
+> Reels cannot be private: they go live on Instagram immediately.
+
 ---
 
 ## How to Use
@@ -198,6 +216,13 @@ python youtube_uploader.py clip1.mp4 --privacy unlisted     # specific files
 python youtube_uploader.py --login                           # only sign in to Google
 ```
 
+Instagram from a terminal:
+
+```bash
+python instagram_uploader.py "output/<Video Title>"      # every .mp4 in the folder
+python instagram_uploader.py --check                     # test token + account
+```
+
 <!-- Replace with a screenshot of the Titles & Hashtags window -->
 ![Titles and Hashtags](screenshots/titles-hashtags.png)
 
@@ -217,6 +242,7 @@ When you run the app, it automatically creates these folders next to `main.py`:
 | `client_secret.json` | Your Google OAuth file for YouTube upload (keep private, never share) |
 | `youtube_token.json` | Saved YouTube login, created after the first sign-in (keep private) |
 | `output/<Video Title>/youtube_uploads.json` | Remembers which clips were already uploaded |
+| `output/<Video Title>/instagram_uploads.json` | Remembers which clips were already posted to Instagram |
 
 ---
 
@@ -231,3 +257,6 @@ When you run the app, it automatically creates these folders next to `main.py`:
 - **"quota exceeded" while uploading:** Your daily YouTube API quota is used up. Run the upload again later – clips that already uploaded are skipped.
 - **Upload says the Google login is invalid / expired:** Delete `youtube_token.json` and upload again to sign in once more.
 - **"The Google account ... has no YouTube channel":** Create a channel on youtube.com with that account first.
+- **Instagram "invalid or expired token" (error 190):** Create a new long-lived token (INSTAGRAM_SETUP.md, step 4) and update `INSTAGRAM_ACCESS_TOKEN` in `.env`, then press **Test connection**.
+- **Instagram "could not process the video":** Re-render the clip as vertical 9:16 (H.264 + AAC) and try again.
+- **Instagram tab says `instagram_uploader.py` was not found:** Put it in the same folder as `main.py` and restart the app.

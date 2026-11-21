@@ -97,6 +97,11 @@ try:  # optional: upload the finished clips to YouTube (all that code lives in y
 except ImportError:
     make_upload_panel_class = None
 
+try:  # optional: post the finished clips to Instagram Reels (all that code lives in instagram_uploader.py)
+    from instagram_uploader import make_instagram_panel_class
+except ImportError:
+    make_instagram_panel_class = None
+
 
 # --------------------------------------------------------------------------- #
 # Paths, config, constants
@@ -3219,7 +3224,7 @@ class ViralClipsApp(ctk.CTk):
             segmented_button_unselected_color=BG, segmented_button_unselected_hover_color=RAISED,
             text_color=TEXT)
         self.tabs.grid(row=1, column=0, sticky="nsew")
-        for name in ("Clips", "Upload", "Log", "JSON"):
+        for name in ("Clips", "Upload", "Instagram", "Log", "JSON"):
             self.tabs.add(name)
         self.tabs._segmented_button.configure(font=font(13, "bold"), text_color=TEXT)
 
@@ -3248,13 +3253,25 @@ class ViralClipsApp(ctk.CTk):
         self.upload_panel = None
         if make_upload_panel_class:
             self.upload_panel = make_upload_panel_class()(
-                upload_tab, on_log=self.log, on_step=lambda state: self.apply_step(len(STEPS) - 1, state),
-                initial_dir=OUTPUT_DIR)
+                upload_tab, on_log=self.log, on_step=self.on_youtube_step, initial_dir=OUTPUT_DIR)
             self.upload_panel.grid(row=0, column=0, sticky="nsew")
         else:
             ctk.CTkLabel(upload_tab, text_color=WARN, font=font(13), justify="center",
                          text="youtube_uploader.py was not found next to main.py.\nPut it in the same folder and "
                               "restart the app to enable uploading.").grid(row=0, column=0, pady=80)
+
+        instagram_tab = self.tabs.tab("Instagram")
+        instagram_tab.grid_columnconfigure(0, weight=1)
+        instagram_tab.grid_rowconfigure(0, weight=1)
+        self.instagram_panel = None
+        if make_instagram_panel_class:
+            self.instagram_panel = make_instagram_panel_class()(
+                instagram_tab, on_log=self.log, initial_dir=OUTPUT_DIR)
+            self.instagram_panel.grid(row=0, column=0, sticky="nsew")
+        else:
+            ctk.CTkLabel(instagram_tab, text_color=WARN, font=font(13), justify="center",
+                         text="instagram_uploader.py was not found next to main.py.\nPut it in the same folder and "
+                              "restart the app to enable Instagram posting.").grid(row=0, column=0, pady=80)
 
         log_tab = self.tabs.tab("Log")
         log_tab.grid_columnconfigure(0, weight=1)
@@ -3598,14 +3615,23 @@ class ViralClipsApp(ctk.CTk):
         self.set_status_now("Cancelling…")
 
     def uploading(self):
-        return bool(self.upload_panel and self.upload_panel.running)
+        return bool((self.upload_panel and self.upload_panel.running)
+                    or (self.instagram_panel and self.instagram_panel.running))
+
+    def on_youtube_step(self, state):
+        """Drives the step-6 pill. When the YouTube upload finished completely and 'Post automatically after the
+        YouTube upload' is ticked in the Instagram tab, the Instagram upload starts by itself."""
+        self.apply_step(len(STEPS) - 1, state)
+        if (state == "done" and self.instagram_panel and self.upload_panel
+                and not self.upload_panel.cancel.is_set()):
+            self.after(800, self.instagram_panel.start_auto)
 
     def reset(self):
         if self.app_state not in ("idle", "finished"):
             return
         if self.uploading():
-            messagebox.showinfo("Upload in progress", "Wait for the YouTube upload to finish (or cancel it in the "
-                                                      "Upload tab) before starting a new video.")
+            messagebox.showinfo("Upload in progress", "Wait for the YouTube / Instagram upload to finish (or "
+                                                      "cancel it in its tab) before starting a new video.")
             return
         self.url_entry.delete(0, "end")
         self.quality_var.set("720p or lower")
@@ -3631,6 +3657,8 @@ class ViralClipsApp(ctk.CTk):
         set_textbox(self.log_box, "")
         if self.upload_panel:
             self.upload_panel.clear()
+        if self.instagram_panel:
+            self.instagram_panel.clear()
         for i in range(len(STEPS)):
             self.apply_step(i, "pending")
         self.progress.set(0)
@@ -3641,9 +3669,12 @@ class ViralClipsApp(ctk.CTk):
 
     def on_close(self):
         if self.uploading():
-            if not messagebox.askyesno("Quit", "A YouTube upload is still running. Stop it and quit?"):
+            if not messagebox.askyesno("Quit", "A YouTube / Instagram upload is still running. Stop it and quit?"):
                 return
-            self.upload_panel.cancel.set()
+            if self.upload_panel:
+                self.upload_panel.cancel.set()
+            if self.instagram_panel:
+                self.instagram_panel.cancel.set()
         if self.app_state in ("running", "review"):
             if not messagebox.askyesno("Quit", "A job is still running. Stop it and quit?"):
                 return
@@ -3771,6 +3802,11 @@ class ViralClipsApp(ctk.CTk):
                 self.upload_panel.load(result["saved"], source=str(result.get("folder", "")))
                 self.log("Clips are listed in the Upload tab (step 6). Nothing is uploaded until you press Upload.")
                 hint = "\n\nWant them on YouTube? Open the Upload tab (step 6)."
+                if self.instagram_panel:
+                    self.instagram_panel.load(result["saved"], source=str(result.get("folder", "")))
+                    self.log("Clips are also listed in the Instagram tab. Nothing is posted until you press Upload "
+                             "(or the YouTube upload finishes, if you ticked the automatic option).")
+                    hint = "\n\nWant them on YouTube / Instagram? Open the Upload or Instagram tab."
             if messagebox.askyesno("Clips ready", result["message"] + hint + "\n\nOpen the output folder now?"):
                 open_path(result["folder"])
             if result.get("open_posts"):
