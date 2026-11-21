@@ -91,7 +91,10 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from yt_dlp.utils import download_range_func
-
+try:
+    from youtube_uploader import offer_youtube_upload
+except ImportError:
+    offer_youtube_upload = None
 
 # --------------------------------------------------------------------------- #
 # Paths, config, constants
@@ -3520,6 +3523,8 @@ class ViralClipsApp(ctk.CTk):
             self.set_status_now("Done")
             if messagebox.askyesno("Clips ready", result["message"] + "\n\nOpen the output folder now?"):
                 open_path(result["folder"])
+            if offer_youtube_upload and result.get("saved"):
+                offer_youtube_upload(self, result["saved"])
             if result.get("open_posts"):
                 self.open_post_copy()
         elif result.get("cancelled"):
@@ -3555,7 +3560,7 @@ class ViralClipsApp(ctk.CTk):
             if ok and job.auto_post:
                 open_posts, note = self.step_post_copy(job, title, folder, saved, transcript_text)
                 lines.append(f"\n{note}")
-            result = {"ok": ok > 0, "folder": folder, "message": "\n".join(lines), "open_posts": open_posts}
+            result = {"ok": ok > 0, "folder": folder, "message": "\n".join(lines), "open_posts": open_posts, "saved": saved}
             if ok == 0:
                 result["message"] = "No clip could be created. Open the Log tab to see the FFmpeg messages."
             self.events.put(("finished", result))

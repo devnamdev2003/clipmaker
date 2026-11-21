@@ -4,3 +4,5 @@ browser-profiles/
 .env
 downloads
 output
+client_secret.json
+youtube_token.json
