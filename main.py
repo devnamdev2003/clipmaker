@@ -70,7 +70,7 @@ import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 import tkinter as tk
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -93,9 +93,9 @@ from google.genai import types
 from yt_dlp.utils import download_range_func
 
 try:  # optional: upload the finished clips to YouTube (all that code lives in youtube_uploader.py)
-    from youtube_uploader import offer_youtube_upload
+    from youtube_uploader import make_upload_panel_class
 except ImportError:
-    offer_youtube_upload = None
+    make_upload_panel_class = None
 
 
 # --------------------------------------------------------------------------- #
@@ -109,7 +109,9 @@ PREVIEW_DIR = BASE_DIR / "previews"
 ENV_FILE = BASE_DIR / ".env"
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
-REQUIRED_CLIPS = 5
+REQUIRED_CLIPS = 5  # clips asked from the AI for every transcript part
+TRANSCRIPT_CHUNK_SECONDS = 35 * 60  # long transcripts go to the AI in parts of about this length (30-40 min)
+MIN_LAST_CHUNK_SECONDS = 5 * 60  # a shorter last part is joined to the part before it
 MAX_AI_ATTEMPTS = 3
 CLIP_TOLERANCE = 1.0  # seconds of slack allowed around the chosen duration range
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -148,7 +150,7 @@ COOKIE_BROWSERS = ["None", "chrome", "edge", "firefox", "brave", "opera", "safar
 
 DEFAULT_INSTRUCTIONS = "Prioritize funny moments with a strong punchline."
 
-STEPS = ["Video info", "Transcript", "AI analysis", "Download", "Create clips"]
+STEPS = ["Video info", "Transcript", "AI analysis", "Download", "Create clips", "Upload"]
 
 FFMPEG_HELP = (
     "FFmpeg (and ffprobe) were not found on this computer.\n\n"
@@ -278,6 +280,7 @@ class Job:
     auto_post: bool = True  # write titles/hashtags for all clips after they are created
     clip_parts_only: bool = True  # download only each clip (+ SECTION_PAD seconds either side), not the whole video
     video_duration: object = None  # length of the YouTube video in seconds (filled in when the video is read)
+    chunks: list = field(default_factory=list)  # transcript parts, see split_transcript()
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -510,8 +513,52 @@ def parse_transcript_text(content):
 # --------------------------------------------------------------------------- #
 # Prompt, AI JSON parsing and validation
 # --------------------------------------------------------------------------- #
+def split_transcript(transcript_text, duration=None, chunk_seconds=TRANSCRIPT_CHUNK_SECONDS):
+    """Cut the '[mm:ss] text' transcript into parts of about `chunk_seconds`, on caption lines.
+    -> [{"index", "start", "end", "text"}]; start/end are the seconds of the video the part covers."""
+    buckets = {}
+    for line in (transcript_text or "").splitlines():
+        match = _TS_LINE.match(line.strip())
+        if not match:
+            continue
+        try:
+            moment = parse_time_value(match.group(1))
+        except ValueError:
+            continue
+        buckets.setdefault(int(moment // chunk_seconds), []).append(line.strip())
+    chunks = []
+    for number in sorted(buckets):
+        chunks.append({"start": number * chunk_seconds, "end": (number + 1) * chunk_seconds,
+                       "text": "\n".join(buckets[number])})
+    if len(chunks) >= 2:  # a tiny tail is not worth a request of its own
+        last = chunks[-1]
+        end = min(last["end"], duration) if duration else last["end"]
+        if end - last["start"] < MIN_LAST_CHUNK_SECONDS:
+            chunks[-2]["text"] += "\n" + last["text"]
+            chunks[-2]["end"] = last["end"]
+            chunks.pop()
+    for number, chunk in enumerate(chunks):
+        if duration:
+            chunk["end"] = min(chunk["end"], float(duration))
+        chunk["index"] = number
+    if chunks:  # no gaps: every part starts where the previous one ended
+        chunks[0]["start"] = 0
+        for before, after in zip(chunks, chunks[1:]):
+            after["start"] = before["end"]
+    return chunks
+
+
+def chunk_label(chunk):
+    return f"{format_timestamp(chunk['start'])}–{format_timestamp(chunk['end'])}"
+
+
+def clips_wanted(chunk):
+    """How many clips to ask for in one part (5, fewer for a short last part)."""
+    return max(1, min(REQUIRED_CLIPS, int((chunk["end"] - chunk["start"]) // 180)))
+
+
 def build_prompt(video_title, source_url, duration, rng, instructions,
-                 transcript_text=None, feedback=None):
+                 transcript_text=None, feedback=None, part=None, count=REQUIRED_CLIPS):
     duration_text = f"{duration:.2f}" if duration else "unknown (do not go past the end of the transcript)"
     if transcript_text is None:
         transcript_block = (
@@ -528,17 +575,24 @@ def build_prompt(video_title, source_url, duration, rng, instructions,
         )
     title_json = json.dumps(video_title, ensure_ascii=False)
     url_json = json.dumps(source_url, ensure_ascii=False)
+    part_text = ""
+    if part:
+        part_text = (
+            f"\nTRANSCRIPT PART: this is part {part['index'] + 1} of {part['total']} of a longer video. It covers "
+            f"{format_timestamp(part['start'])} to {format_timestamp(part['end'])} "
+            f"({part['start']:.0f}s to {part['end']:.0f}s). Choose moments ONLY from inside this range: every "
+            "clip must start and end between those two times.\n")
     return f"""You are an expert short-form video editor. Analyze the timestamped transcript
-and identify the five strongest short-form viral moments for Instagram Reels and YouTube Shorts.
+and identify the {count} strongest short-form viral moments for Instagram Reels and YouTube Shorts.
 
 VIDEO TITLE: {video_title}
 SOURCE URL: {source_url}
 FULL VIDEO DURATION IN SECONDS: {duration_text}
 REQUIRED CLIP DURATION: {rng[0]} to {rng[1]} seconds per clip.
 ADDITIONAL USER INSTRUCTIONS: {instructions or "None. Use your best editorial judgment."}
-{correction}
+{part_text}{correction}
 Requirements:
-- Return exactly 5 distinct moments, ranked from strongest to fifth strongest.
+- Return exactly {count} distinct moments, ranked from strongest to weakest.
 - Every clip MUST be between {rng[0]} and {rng[1]} seconds inclusive.
 - Prioritize the requested duration range over other editorial preferences.
 - Choose self-contained moments with a clear hook, funny/emotional/surprising payoff,
@@ -633,8 +687,9 @@ def _first_value(raw, *keys):
     raise KeyError(keys[0])
 
 
-def build_clips(raw_clips, video_duration, rng, tolerance=CLIP_TOLERANCE):
-    """Validate/repair clips. Returns (valid_clips, problems)."""
+def build_clips(raw_clips, video_duration, rng, tolerance=CLIP_TOLERANCE, required=REQUIRED_CLIPS, window=None):
+    """Validate/repair clips. window=(start, end) keeps only clips inside that part of the video.
+    Returns (valid_clips, problems)."""
     clips, problems = [], []
     min_len, max_len = rng
     for index, raw in enumerate(raw_clips, 1):
@@ -660,6 +715,10 @@ def build_clips(raw_clips, video_duration, rng, tolerance=CLIP_TOLERANCE):
                     problems.append(f"{label} ends at {end:.1f}s, beyond the video length ({video_duration:.1f}s).")
                     continue
                 end = video_duration
+        if window and (start < window[0] - 5 or end > window[1] + 5):
+            problems.append(f"{label} ({start:.0f}s to {end:.0f}s) is outside this transcript part "
+                            f"({window[0]:.0f}s to {window[1]:.0f}s).")
+            continue
         length = end - start
         if length < min_len - tolerance or length > max_len + tolerance:
             problems.append(f"{label} is {length:.1f}s long, outside the {min_len}-{max_len}s range.")
@@ -673,11 +732,11 @@ def build_clips(raw_clips, video_duration, rng, tolerance=CLIP_TOLERANCE):
         clips.append(Clip(rank, title, description, start, end))
 
     clips.sort(key=lambda c: c.rank)
-    clips = clips[:REQUIRED_CLIPS]
+    clips = clips[:required]
     for new_rank, clip in enumerate(clips, 1):
         clip.rank = new_rank
-    if len(raw_clips) < REQUIRED_CLIPS:
-        problems.append(f"Only {len(raw_clips)} clips were returned; exactly {REQUIRED_CLIPS} are needed.")
+    if len(raw_clips) < required:
+        problems.append(f"Only {len(raw_clips)} clips were returned; exactly {required} are needed.")
     return clips, problems
 
 
@@ -1579,7 +1638,8 @@ def clip_output_size(clip, default_size):
 class EditorSession:
     """Everything the editor page needs to know about the current video."""
 
-    def __init__(self, video_id, title, duration, embeddable, clips, default_size, video_path=None, parts=None):
+    def __init__(self, video_id, title, duration, embeddable, clips, default_size, video_path=None, parts=None,
+                 chunks=None):
         self.video_id = video_id
         self.title = title
         self.duration = duration
@@ -1592,6 +1652,12 @@ class EditorSession:
         self.version = 1 if (video_path or self.parts) else 0  # changes whenever the file to play changes
         self.task = {"name": "", "percent": 0, "message": "", "error": ""}
         self.clip_jobs = {}  # "download this clip" jobs: id -> {status, percent, message, error, path, name}
+        self.chunks = list(chunks or [])  # transcript parts that the AI has not seen / has seen (see next_chunk)
+        self.next_chunk = 0  # the part the "Find clips" button works on next
+        self.pending = None  # (part number, clips) found by the AI but not yet added (e.g. download failed)
+        self.more = {"busy": False, "message": "", "error": ""}  # state of the AI search for clips
+        self.clips_version = 0  # changes whenever clips are added
+        self.lock = threading.Lock()
 
     @property
     def play_path(self):
@@ -1608,12 +1674,23 @@ class EditorSession:
     def set_task(self, **values):
         self.task.update(values)
 
+    def more_info(self):
+        total = len(self.chunks)
+        nxt = self.next_chunk
+        return {"busy": bool(self.more.get("busy")), "message": self.more.get("message", ""),
+                "error": self.more.get("error", ""), "next": nxt, "total": total, "done": nxt >= total,
+                "label": chunk_label(self.chunks[nxt]) if nxt < total else "", "found": len(self.clips),
+                "clips_version": self.clips_version}
+
     def state(self):
-        return {"task": dict(self.task), "local": bool(self.parts or self.play_path), "version": self.version}
+        return {"task": dict(self.task), "local": bool(self.parts or self.play_path), "version": self.version,
+                "more": self.more_info()}
 
     def data(self):
         items = []
-        for clip in self.clips:
+        with self.lock:
+            clips = list(self.clips)
+        for clip in clips:
             size = self.default_size if clip.size == SIZE_DEFAULT else clip.size
             items.append({
                 "rank": clip.rank, "title": clip.title, "description": clip.description,
@@ -1626,7 +1703,7 @@ class EditorSession:
             "video_id": self.video_id, "title": self.title, "duration": self.duration,
             "embeddable": self.embeddable, "clips": items,
             "parts": [{"start": part["start"], "end": part["end"]} for part in self.parts],
-            "local": bool(self.parts or self.play_path), "version": self.version,
+            "local": bool(self.parts or self.play_path), "version": self.version, "more": self.more_info(),
         }
 
 
@@ -1643,8 +1720,8 @@ body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 "Segoe UI",s
 header{padding:16px 24px;border-bottom:1px solid var(--line)}
 h1{font-size:18px;margin:0 0 2px}
 .sub{color:var(--muted);font-size:12px}
-main{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(380px,1fr);gap:18px;padding:18px 24px 100px}
-@media(max-width:980px){main{grid-template-columns:1fr}.stage{position:static!important}}
+main{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(340px,1fr);gap:18px;padding:18px 24px 130px}
+@media(max-width:980px){main{grid-template-columns:1fr}}
 .stage{position:sticky;top:14px;align-self:start}
 .player-box{position:relative;aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden;border:1px solid var(--line)}
 #player,#player iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
@@ -1674,7 +1751,14 @@ background:rgba(0,0,0,.6);padding:2px 9px;border-radius:10px;white-space:nowrap;
 .danger{color:var(--bad)}
 #pvc{touch-action:none}
 #pvc.hasText{cursor:grab}
-.stage{max-height:calc(100vh - 135px);overflow-y:auto;padding-bottom:8px}
+.stage{top:12px;max-height:calc(100vh - 150px);overscroll-behavior:contain;overflow-y:auto;overflow-x:hidden;padding:0 6px 8px 0;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+.stage::-webkit-scrollbar{width:8px}.stage::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
+/* wide windows: video panel stays pinned on the left (it scrolls by itself only if taller than the window), only the clip list on the right scrolls */
+/* narrow windows (one column): nothing is pinned, the whole page scrolls */
+@media(max-width:980px){.stage{position:static!important;max-height:none!important;overflow:visible!important}}
+@media(max-width:560px){.stagetop{flex-wrap:wrap}.stagetop .player-box{flex:1 1 100%}main{padding:14px 12px 150px}header{padding:12px 14px}footer{padding:10px 12px}}
+/* clip (not hidden): hidden would turn the page into a scroll box and break the pinned left panel */
+body{max-width:100%;overflow-x:clip}
 .scrubrow{display:flex;gap:10px;align-items:center;margin-top:10px}
 .scrubrow input[type=range]{flex:1;accent-color:var(--accent);padding:0}
 #player video{position:absolute;inset:0;width:100%;height:100%;background:#000;object-fit:contain}
@@ -1709,12 +1793,28 @@ button:hover{background:var(--line)}
 .primary:disabled{opacity:.5;cursor:default}
 .len{margin-top:8px;font-size:12px;color:var(--muted)}
 .err{font-size:12px;color:var(--bad);min-height:0}
+#finder{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:12px}
+#finder .fh{font-weight:700;font-size:15px;margin-bottom:4px}
+#finder .fh.ok{color:var(--good)}
+#finder .primary{padding:8px 16px;font-size:14px}
+#finder .busy{margin-top:8px;color:var(--accent);font-size:13px}
+.fbtns{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 footer{position:fixed;left:0;right:0;bottom:0;background:var(--panel);border-top:1px solid var(--line);
-padding:12px 24px;display:flex;align-items:center;gap:16px;justify-content:space-between}
+padding:12px 24px;display:flex;align-items:center;gap:10px 16px;justify-content:space-between;flex-wrap:wrap;z-index:5}
 #msg{font-size:13px;color:var(--soft)}
 #msg.bad{color:var(--bad)}
 #done{position:fixed;inset:0;background:rgba(16,18,24,.96);display:none;align-items:center;justify-content:center;text-align:center;padding:30px}
 #done h2{margin:0 0 8px}
+/* wide windows: two panes. The page itself does not scroll: the LEFT panel and the RIGHT clip list each have their own scrollbar */
+@media(min-width:981px){
+body{height:100vh;display:flex;flex-direction:column;overflow:hidden}
+header{flex:none}
+main{flex:1 1 auto;min-height:0;overflow:hidden;padding:14px 24px 12px;grid-template-rows:minmax(0,1fr);align-items:stretch}
+.stage{position:static!important;top:auto;height:100%;max-height:none!important;overflow-y:auto!important;overflow-x:hidden;padding:0 8px 12px 0;overscroll-behavior:auto}
+.rcol{min-height:0;height:100%;overflow-y:auto;overflow-x:hidden;padding:0 8px 16px 0;scrollbar-width:thin;scrollbar-color:var(--accent) transparent}
+.rcol::-webkit-scrollbar{width:10px}.rcol::-webkit-scrollbar-thumb{background:var(--line);border-radius:5px}.rcol::-webkit-scrollbar-thumb:hover{background:var(--accent)}
+footer{position:static;flex:none}
+}
 </style></head>
 <body>
 <header><h1 id="vtitle">Clip editor</h1>
@@ -1743,11 +1843,11 @@ padding:12px 24px;display:flex;align-items:center;gap:16px;justify-content:space
   <b>Split screen:</b> set Layout to “Split: top + bottom” on a clip to show two different parts of the video in one vertical clip - drag the blue TOP box and the gold BOTTOM box.
   Width and height must be even numbers; the video is scaled to fill the frame and the part inside your frame is cut out.</div>
  </section>
- <section id="list"></section>
+ <div class="rcol"><div id="finder"></div><section id="list"></section></div>
 </main>
 <footer>
  <div id="msg"></div>
- <button class="primary" id="gen">Generate clips</button>
+ <div class="fbtns"><button id="more2" style="padding:10px 16px">Find clips</button><button class="primary" id="gen">Generate clips</button></div>
 </footer>
 <div id="done"><div><h2>Sent to the app</h2>
 <div class="sub" style="font-size:14px">Your clips are being created.<br>Go back to Viral Clips Studio to watch the progress. You can close this window.</div></div></div>
@@ -1756,12 +1856,14 @@ padding:12px 24px;display:flex;align-items:center;gap:16px;justify-content:space
 const D=JSON.parse(document.getElementById('data').textContent);
 const $=s=>document.querySelector(s);
 const defReg=k=>({x:k==='top'?0:1,y:.5,z:1,fit:false});
-const clips=D.clips.map(c=>{const s=c.split||{};
+const mk=c=>{const s=c.split||{};
  return {...c,enabled:true,cx:c.crop_x==null?.5:c.crop_x,cy:c.crop_y==null?.5:c.crop_y,layout:c.layout==='split'?'split':'single',texts:[],ti:0,
-  ratio:s.ratio==null?.5:s.ratio,top:{...defReg('top'),...(s.top||{})},bottom:{...defReg('bottom'),...(s.bottom||{})}}});
+  ratio:s.ratio==null?.5:s.ratio,top:{...defReg('top'),...(s.top||{})},bottom:{...defReg('bottom'),...(s.bottom||{})}}};
+const clips=D.clips.map(mk);
+const st0=()=>clips[active]?clips[active].start:0;
 let active=0,player=null,ready=false,stopAt=null,duration=D.duration||0;
 let ytPlayer=null,local=false,localVersion=0,SA=16/9;
-const PARTS=D.parts||[];
+let PARTS=D.parts||[];
 if(PARTS.length)document.querySelector('header .sub').textContent="Set each clip's time and size, then press Generate. Only each clip (plus 10 s before and after) was downloaded, not the whole video.";let curPart=-1,pendingSeek=null,wantPlay=false;
 function partFor(t){let best=0,bd=1e9;for(let i=0;i<PARTS.length;i++){const p=PARTS[i];
  if(t>=p.start-0.01&&t<=p.end+0.01)return i;const d=Math.min(Math.abs(t-p.start),Math.abs(t-p.end));if(d<bd){bd=d;best=i}}return best}
@@ -2036,7 +2138,7 @@ function banner(text){const b=$('#banner');b.textContent=text;b.style.display='b
 if(D.embeddable===false)banner('YouTube does not allow this video to be played outside youtube.com, so the preview may stay black. Press “Download the video first” below to edit from the file, or type the times by hand.');
 window.onYouTubeIframeAPIReady=()=>{ytPlayer=player=new YT.Player('player',{videoId:D.video_id,host:'https://www.youtube.com',
  playerVars:{rel:0,playsinline:1,modestbranding:1,origin:location.origin},
- events:{onReady:()=>{ready=true;duration=player.getDuration()||duration;$('#total').textContent=fmt(duration);clips.forEach((_,i)=>sync(i));seek(clips[active].start)},
+ events:{onReady:()=>{ready=true;duration=player.getDuration()||duration;$('#total').textContent=fmt(duration);clips.forEach((_,i)=>sync(i));seek(st0())},
  onError:()=>banner('The video could not be played from YouTube here. Press “Download the video first” below to edit from the file, or type the times by hand.')}})};
 if(!D.local){const s=document.createElement('script');s.src='https://www.youtube.com/iframe_api';document.head.appendChild(s);
  setTimeout(()=>{if(!ready&&!local)banner('The YouTube preview is slow or not loading. Press “Download the video first” below to edit from the file instead.')},15000)}
@@ -2064,14 +2166,14 @@ function startLocal(){
     getDuration:()=>duration,getPlayerState:()=>v.paused?2:1};
    ready=true;
    if(pendingSeek!==null){v.currentTime=pendingSeek;pendingSeek=null;if(wantPlay){wantPlay=false;v.play()}}
-   if(first){duration=D.duration||duration;$('#total').textContent=fmt(duration);clips.forEach((_,i)=>sync(i));seek(clips[active].start)}
+   if(first){duration=D.duration||duration;$('#total').textContent=fmt(duration);clips.forEach((_,i)=>sync(i));seek(st0())}
    return}
   player={seekTo:t=>{v.currentTime=t},playVideo:()=>v.play(),pauseVideo:()=>v.pause(),getCurrentTime:()=>v.currentTime,
    getDuration:()=>v.duration,getPlayerState:()=>v.paused?2:1};
-  ready=true;duration=v.duration||duration;$('#total').textContent=fmt(duration);clips.forEach((_,i)=>sync(i));seek(clips[active].start)});
+  ready=true;duration=v.duration||duration;$('#total').textContent=fmt(duration);clips.forEach((_,i)=>sync(i));seek(st0())});
  v.addEventListener('error',()=>{banner('Your browser cannot play the downloaded file. Press “Make a smaller preview copy” (it can take a few minutes for a long video).');
   $('#pv').style.display='';$('#pv').disabled=false;$('#pv').textContent=PARTS.length?'Make smaller preview copies':'Make a smaller preview copy'});
- if(PARTS.length){curPart=partFor(clips[active].start);v.src='/video'+location.search+'&part='+curPart+'&v='+Date.now()}
+ if(PARTS.length){curPart=partFor(st0());v.src='/video'+location.search+'&part='+curPart+'&v='+Date.now()}
  else v.src='/video'+location.search+'&v='+Date.now();
  $('#dl').style.display='none';
  $('#lbtext').textContent=PARTS.length?'Editing from the downloaded clip parts ✓  Each clip has 10 s extra before and after - move the start/end anywhere inside it.'
@@ -2112,6 +2214,9 @@ async function downloadClip(i,btn){
  }catch(err){msg(err.message,true)}
  btn.disabled=false;btn.textContent=label}
 $('#gen').addEventListener('click',async()=>{
+ if(MORE.busy)return msg('The AI is still looking for clips. Please wait.',true);
+ if(!clips.length)return msg('No clips yet. Press “Find clips” first.',true);
+ if(!MORE.done&&!confirm(`Only part ${MORE.next} of ${MORE.total} of the transcript has been analysed.\n\nGenerate the clips you have now? (This closes the editor.)`))return;
  const out=[];let bad='';
  clips.forEach(c=>{if(!c.enabled)return;const e=validate(c);if(e&&!bad)bad=`Clip #${c.rank}: ${e}.`;
   out.push({rank:c.rank,title:c.title,description:c.description,start:c.start,end:c.end,width:c.width||null,height:c.height||null,crop_x:c.cx,crop_y:c.cy,
@@ -2123,7 +2228,59 @@ $('#gen').addEventListener('click',async()=>{
   const j=await r.json();if(!j.ok)throw new Error(j.error||'The app rejected the clips.');
   if(ready)player.pauseVideo();$('#done').style.display='flex'}
  catch(err){btn.disabled=false;msg(err.message,true)}});
-msg(`${clips.length} clips ready to edit.`);
+
+// ---- find clips part by part ----------------------------------------------------------------
+let MORE=D.more||{busy:false,next:0,total:0,done:true,label:'',found:0,clips_version:0,error:'',message:''};
+let clipsVer=MORE.clips_version||0,moreTimer=null;
+function findLabel(){return MORE.next===0?`Find clips in part 1 (${MORE.label})`:`Find more clips from part ${MORE.next+1} (${MORE.label})`}
+function renderFinder(){
+ const m=MORE,fin=$('#finder'),b2=$('#more2');let h='';
+ if(m.done&&m.total){h=`<div class="fh ok">✓ Transcript done</div><div class="sub">All ${m.total} part${m.total>1?'s':''} of the transcript have been analysed and ${clips.length} clip${clips.length===1?'':'s'} ${clips.length===1?'was':'were'} found. Edit them below, then press “Generate clips”.</div>`}
+ else if(m.total){
+  h=`<div class="fh">${m.next===0?'Find clips with the AI':'Find more clips'}</div>
+  <div class="sub">Long transcripts are sent to the AI in parts. Part ${m.next+1} of ${m.total} covers ${esc(m.label)}.${m.next?` ${clips.length} clips found so far.`:''} You may end up with more than 5 clips.</div>
+  <div class="row"><button class="primary" data-find="1"${m.busy?' disabled':''}>${esc(findLabel())}</button></div>`}
+ else h=`<div class="sub">This video has no transcript parts to analyse.</div>`;
+ if(m.busy)h+=`<div class="busy">⏳ ${esc(m.message||'Working…')}</div>`;
+ if(m.error)h+=`<div class="err" style="margin-top:6px">${esc(m.error)}</div>`;
+ fin.innerHTML=h;
+ b2.style.display=(m.done||!m.total)?'none':'';b2.disabled=!!m.busy;b2.textContent=m.busy?'Finding clips…':findLabel();
+ $('#gen').disabled=!!m.busy}
+async function refreshClips(){
+ const d=await (await fetch('/clips'+location.search)).json();
+ PARTS=d.parts||[];
+ const first=clips.length,add=(d.clips||[]).slice(first);
+ if(add.length){
+  add.forEach(c=>clips.push(mk(c)));
+  $('#list').insertAdjacentHTML('beforeend',add.map((c,k)=>cardHTML(clips[first+k],first+k)).join(''));
+  for(let i=first;i<clips.length;i++){sync(i);refreshText(i)}
+  select(first);if(ready)seek(st0());
+  const el=document.querySelector(`.card[data-i="${first}"]`);if(el)el.scrollIntoView({behavior:'smooth',block:'start'});
+  msg(`${add.length} new clip${add.length===1?'':'s'} added - ${clips.length} in total.`)}
+ clipsVer=d.more.clips_version;MORE=d.more}
+async function pollMore(){
+ clearTimeout(moreTimer);
+ try{
+  const s=await (await fetch('/state'+location.search)).json();
+  const wasBusy=MORE.busy;MORE=s.more||MORE;
+  if(MORE.clips_version!==clipsVer)await refreshClips();
+  if(s.local&&s.version!==localVersion){localVersion=s.version;startLocal()}
+  renderFinder();
+  if(MORE.busy)moreTimer=setTimeout(pollMore,1000);
+  else if(wasBusy&&MORE.error)msg(MORE.error,true);
+ }catch(e){moreTimer=setTimeout(pollMore,1500)}}
+async function findMore(){
+ if(MORE.busy)return;
+ MORE.busy=true;MORE.message='Starting…';MORE.error='';renderFinder();
+ try{const j=await post('find');
+  if(!j.ok){MORE.busy=false;MORE.error=j.error||'Could not start.';renderFinder();return}
+  pollMore()}
+ catch(e){MORE.busy=false;MORE.error=e.message;renderFinder()}}
+$('#finder').addEventListener('click',e=>{if(e.target.closest('[data-find]'))findMore()});
+$('#more2').addEventListener('click',findMore);
+renderFinder();
+msg(clips.length?`${clips.length} clips ready to edit.`:'Press “Find clips” to let the AI pick the best moments.');
+if(MORE.busy)pollMore();
 </script></body></html>
 """
 
@@ -2214,6 +2371,8 @@ class EditorServer:
                     self._send(200, EDITOR_HTML.replace("__DATA__", data), "text/html; charset=utf-8")
                 elif parsed.path == "/state":
                     self._send(200, json.dumps(outer.session.state()), "application/json; charset=utf-8")
+                elif parsed.path == "/clips":  # the full list again (the page asks for it when clips were added)
+                    self._send(200, json.dumps(outer.session.data(), ensure_ascii=False), "application/json; charset=utf-8")
                 elif parsed.path == "/video":
                     self._send_video(parsed)
                 elif parsed.path == "/clipstate":
@@ -2334,18 +2493,51 @@ def field_label(parent, text):
     return ctk.CTkLabel(parent, text=text, anchor="w", text_color=SOFT, font=font(12))
 
 
+def attach_flow(frame, get_widgets, all_widgets, gap=8):
+    """Lay widgets out left to right and wrap them onto new rows when the frame is too narrow.
+    Returns relayout(): call it after the list of visible widgets changes."""
+    state = {"width": -1}
+
+    def layout(_event=None):
+        width = frame.winfo_width()
+        if width < 40 or width == state["width"]:
+            return
+        state["width"] = width
+        for widget in all_widgets:
+            widget.grid_forget()
+        x = row = col = 0
+        for widget in get_widgets():
+            need = widget.winfo_reqwidth() + gap
+            if col and x + need > width:
+                row, col, x = row + 1, 0, 0
+            widget.grid(row=row, column=col, padx=(0, gap), pady=(0, 6), sticky="w")
+            x += need
+            col += 1
+
+    def relayout():
+        state["width"] = -1
+        layout()
+
+    frame.bind("<Configure>", layout, add="+")
+    return relayout
+
+
 class ModalBase(ctk.CTkToplevel):
-    def __init__(self, parent, title, width, height, on_done, resizable=False):
+    def __init__(self, parent, title, width, height, on_done, resizable=True):
         super().__init__(parent)
         self._on_done = on_done
         self._closed = False
         self.title(title)
         self.configure(fg_color=BG)
-        self.resizable(resizable, resizable)
-        self.minsize(min(width, 560), min(height, 420))
+        self.resizable(True, True)  # always resizable, so nothing is ever stuck off-screen
         parent.update_idletasks()
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        width, height = min(width, screen_w - 40), min(height, screen_h - 110)  # never taller than the screen
+        self.minsize(min(width, 480), min(height, 360))
         x = parent.winfo_rootx() + max(0, (parent.winfo_width() - width) // 2)
         y = parent.winfo_rooty() + max(0, (parent.winfo_height() - height) // 3)
+        x = max(0, min(x, screen_w - width - 10))
+        y = max(0, min(y, screen_h - height - 70))
         self.geometry(f"{width}x{height}+{x}+{y}")
         self.transient(parent)
         self.protocol("WM_DELETE_WINDOW", lambda: self.close(None))
@@ -2899,14 +3091,17 @@ class ViralClipsApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Viral Clips Studio")
-        self.geometry("1240x880")
-        self.minsize(1060, 780)
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        width, height = min(1240, screen_w - 40), min(880, screen_h - 90)
+        self.geometry(f"{width}x{height}+{max(0, (screen_w - width) // 2)}+{max(0, (screen_h - height) // 3)}")
+        self.minsize(min(880, width), min(540, height))  # small screens: everything scrolls instead of being cut off
         self.configure(fg_color=BG)
 
         self.events = queue.Queue()
         self.app_state = "idle"  # idle | running | review | finished
         self.job = None
         self.cards = []
+        self.found_clips = []  # every clip the AI found so far (the cards in the Clips tab)
         self.review_waiter = None
         self.editor_session = None
         self.editor_server = None
@@ -2953,9 +3148,8 @@ class ViralClipsApp(ctk.CTk):
         quiet_button(header, "Output folder", self.open_output, width=120).pack(side="right", padx=8)
 
         # Sidebar
-        side = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=14, width=380)
+        side = ctk.CTkScrollableFrame(self, fg_color=PANEL, corner_radius=14, width=336)
         side.grid(row=1, column=0, sticky="ns", padx=(22, 10), pady=(0, 10))
-        side.grid_propagate(False)
         side.grid_columnconfigure(0, weight=1)
 
         field_label(side, "YouTube link").grid(row=0, column=0, sticky="w", padx=20, pady=(20, 0))
@@ -2998,7 +3192,7 @@ class ViralClipsApp(ctk.CTk):
         status_box = ctk.CTkFrame(side, fg_color=BG, corner_radius=10)
         status_box.grid(row=10 + len(switches), column=0, sticky="ew", padx=20, pady=(0, 20))
         status_box.grid_columnconfigure(0, weight=1)
-        self.key_label = ctk.CTkLabel(status_box, text="", anchor="w", justify="left", wraplength=290,
+        self.key_label = ctk.CTkLabel(status_box, text="", anchor="w", justify="left", wraplength=270,
                                       font=font(12), text_color=SOFT)
         self.key_label.grid(row=0, column=0, sticky="ew", padx=14, pady=12)
 
@@ -3009,13 +3203,15 @@ class ViralClipsApp(ctk.CTk):
         main.grid_rowconfigure(1, weight=1)
 
         step_bar = ctk.CTkFrame(main, fg_color="transparent")
-        step_bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        step_bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         self.step_labels = []
         for i, name in enumerate(STEPS):
             label = ctk.CTkLabel(step_bar, text=f"{i + 1}. {name}", height=30, corner_radius=15,
-                                 fg_color=RAISED, text_color=MUTED, font=font(12, "bold"), padx=14)
-            label.pack(side="left", padx=(0, 8))
+                                 fg_color=RAISED, text_color=MUTED, font=font(12, "bold"), padx=12)
             self.step_labels.append(label)
+        attach_flow(step_bar, lambda: self.step_labels, self.step_labels)  # wraps on narrow windows
+        self.step_labels[-1].configure(cursor="hand2")  # the Upload step opens the Upload tab
+        self.step_labels[-1].bind("<Button-1>", lambda _e: self.tabs.set("Upload"))
 
         self.tabs = ctk.CTkTabview(
             main, fg_color=PANEL, corner_radius=14, segmented_button_fg_color=BG,
@@ -3023,7 +3219,7 @@ class ViralClipsApp(ctk.CTk):
             segmented_button_unselected_color=BG, segmented_button_unselected_hover_color=RAISED,
             text_color=TEXT)
         self.tabs.grid(row=1, column=0, sticky="nsew")
-        for name in ("Clips", "Log", "JSON"):
+        for name in ("Clips", "Upload", "Log", "JSON"):
             self.tabs.add(name)
         self.tabs._segmented_button.configure(font=font(13, "bold"), text_color=TEXT)
 
@@ -3045,6 +3241,20 @@ class ViralClipsApp(ctk.CTk):
             self.clips_frame, text_color=MUTED, font=font(14), justify="center",
             text="No clips yet.\nPaste a YouTube link on the left and press Analyze.")
         self.empty_label.grid(row=0, column=0, pady=90)
+
+        upload_tab = self.tabs.tab("Upload")
+        upload_tab.grid_columnconfigure(0, weight=1)
+        upload_tab.grid_rowconfigure(0, weight=1)
+        self.upload_panel = None
+        if make_upload_panel_class:
+            self.upload_panel = make_upload_panel_class()(
+                upload_tab, on_log=self.log, on_step=lambda state: self.apply_step(len(STEPS) - 1, state),
+                initial_dir=OUTPUT_DIR)
+            self.upload_panel.grid(row=0, column=0, sticky="nsew")
+        else:
+            ctk.CTkLabel(upload_tab, text_color=WARN, font=font(13), justify="center",
+                         text="youtube_uploader.py was not found next to main.py.\nPut it in the same folder and "
+                              "restart the app to enable uploading.").grid(row=0, column=0, pady=80)
 
         log_tab = self.tabs.tab("Log")
         log_tab.grid_columnconfigure(0, weight=1)
@@ -3080,16 +3290,30 @@ class ViralClipsApp(ctk.CTk):
 
         buttons = ctk.CTkFrame(bottom, fg_color="transparent")
         buttons.grid(row=0, column=1, padx=(0, 20), pady=14)
+        self._bottom_wide = True
+
+        def place_buttons(event):
+            wide = event.width >= 1120
+            if wide != self._bottom_wide:
+                self._bottom_wide = wide
+                if wide:
+                    progress_area.grid_configure(padx=(20, 12))
+                    buttons.grid_configure(row=0, column=1, columnspan=1, sticky="", padx=(0, 20), pady=14)
+                else:
+                    progress_area.grid_configure(padx=(20, 20))
+                    buttons.grid_configure(row=1, column=0, columnspan=2, sticky="e", padx=(20, 20), pady=(0, 14))
+
+        bottom.bind("<Configure>", place_buttons)
         self.reset_btn = quiet_button(buttons, "New video", self.reset, width=100, height=38)
         self.reset_btn.pack(side="left", padx=(0, 8))
         self.cancel_btn = ctk.CTkButton(buttons, text="Cancel", command=self.cancel_job, width=90, height=38,
                                         fg_color="#5a2a2e", hover_color="#733439", text_color="#ffd9d9",
                                         font=font(13), corner_radius=8)
         self.cancel_btn.pack(side="left", padx=(0, 8))
-        self.edit_btn = primary_button(buttons, "Edit clips (time and size)", self.open_editor, width=210)
-        self.create_btn = quiet_button(buttons, "Create selected clips", self.create_selected, width=170, height=38)
+        self.edit_btn = primary_button(buttons, "Edit clips (time and size)", self.open_editor, width=190)
+        self.create_btn = quiet_button(buttons, "Create selected clips", self.create_selected, width=156, height=38)
         self.create_btn.pack(side="left", padx=(0, 8))
-        self.start_btn = primary_button(buttons, "Analyze and create clips", self.on_primary, width=200)
+        self.start_btn = primary_button(buttons, "Analyze and create clips", self.on_primary, width=190)
         self.start_btn.pack(side="left")
 
     def refresh_key_status(self):
@@ -3173,6 +3397,10 @@ class ViralClipsApp(ctk.CTk):
 
     def on_primary(self):
         if self.app_state not in ("idle", "finished"):
+            return
+        if self.uploading():
+            messagebox.showinfo("Upload in progress", "Wait for the YouTube upload to finish (or cancel it in the "
+                                                      "Upload tab) before analysing a new video.")
             return
         url = self.url_entry.get().strip()
         if not url:
@@ -3295,6 +3523,8 @@ class ViralClipsApp(ctk.CTk):
         waiter = self.review_waiter
         if waiter is None or self.app_state != "review":
             raise ValueError("The app is not waiting for clips right now.")
+        if self.editor_session is not None and self.editor_session.more.get("busy"):
+            raise ValueError("The AI is still looking for clips. Wait until it has finished.")
         self.review_waiter = None
         self.events.put(("state", "running"))
         waiter.resolve(("edited", clips))
@@ -3367,8 +3597,15 @@ class ViralClipsApp(ctk.CTk):
             self.review_waiter.resolve(None)
         self.set_status_now("Cancelling…")
 
+    def uploading(self):
+        return bool(self.upload_panel and self.upload_panel.running)
+
     def reset(self):
         if self.app_state not in ("idle", "finished"):
+            return
+        if self.uploading():
+            messagebox.showinfo("Upload in progress", "Wait for the YouTube upload to finish (or cancel it in the "
+                                                      "Upload tab) before starting a new video.")
             return
         self.url_entry.delete(0, "end")
         self.quality_var.set("720p or lower")
@@ -3392,6 +3629,8 @@ class ViralClipsApp(ctk.CTk):
         self.empty_label.grid(row=0, column=0, pady=90)
         set_textbox(self.json_box, "")
         set_textbox(self.log_box, "")
+        if self.upload_panel:
+            self.upload_panel.clear()
         for i in range(len(STEPS)):
             self.apply_step(i, "pending")
         self.progress.set(0)
@@ -3401,6 +3640,10 @@ class ViralClipsApp(ctk.CTk):
         self.status_var.set(text)
 
     def on_close(self):
+        if self.uploading():
+            if not messagebox.askyesno("Quit", "A YouTube upload is still running. Stop it and quit?"):
+                return
+            self.upload_panel.cancel.set()
         if self.app_state in ("running", "review"):
             if not messagebox.askyesno("Quit", "A job is still running. Stop it and quit?"):
                 return
@@ -3523,10 +3766,13 @@ class ViralClipsApp(ctk.CTk):
         if result.get("ok"):
             self.progress.set(1)
             self.set_status_now("Done")
-            if messagebox.askyesno("Clips ready", result["message"] + "\n\nOpen the output folder now?"):
+            hint = ""
+            if self.upload_panel and result.get("saved"):
+                self.upload_panel.load(result["saved"], source=str(result.get("folder", "")))
+                self.log("Clips are listed in the Upload tab (step 6). Nothing is uploaded until you press Upload.")
+                hint = "\n\nWant them on YouTube? Open the Upload tab (step 6)."
+            if messagebox.askyesno("Clips ready", result["message"] + hint + "\n\nOpen the output folder now?"):
                 open_path(result["folder"])
-            if offer_youtube_upload and result.get("saved"):
-                offer_youtube_upload(self, result["saved"])  # asks "Upload to YouTube?"
             if result.get("open_posts"):
                 self.open_post_copy()
         elif result.get("cancelled"):
@@ -3541,14 +3787,20 @@ class ViralClipsApp(ctk.CTk):
             title, duration, transcript_text, info = self.step_info(job)
             transcript_text = self.step_transcript(job, info)
             self.post_context = {"title": title, "url": job.url, "transcript": transcript_text}
-            clips = self.step_ai(job, info, title, duration, transcript_text)
-            if not job.auto_create:
-                answer = self.step_review(job, info, title, duration, clips)
+            job.chunks = split_transcript(transcript_text, duration)
+            if not job.chunks:
+                raise UserFacingError("The transcript has no timestamped lines the AI can read.")
+            self.log(f"The transcript is sent to the AI in {len(job.chunks)} part{'s' if len(job.chunks) != 1 else ''}: "
+                     + ", ".join(chunk_label(c) for c in job.chunks) + ".")
+            if job.auto_create:
+                clips = self.step_ai_all(job, title, duration, job.chunks)
+            else:
+                answer = self.step_review(job, info, title, duration, job.chunks)
                 if not answer:
                     raise JobCancelled()
                 kind, value = answer
                 if kind == "selected":
-                    clips = [clips[i] for i in value]
+                    clips = [self.found_clips[i] for i in value]
                 else:  # clips edited in the editor
                     clips = value
                     self.sync_cards(clips)
@@ -3659,43 +3911,60 @@ class ViralClipsApp(ctk.CTk):
         return text
 
     # step 3 ---------------------------------------------------------------
-    def step_ai(self, job, info, title, duration, transcript_text):
-        self.set_step(2, "active")
-        rng = job.duration_range
+    def find_clips(self, job, title, duration, chunk, total):
+        """The AI step for ONE transcript part: Gemini first, the manual Gemini chat as the fallback.
+        -> clips ranked 1..n"""
+        part = {"index": chunk["index"], "total": total, "start": chunk["start"], "end": chunk["end"]}
+        required = clips_wanted(chunk)
         reason = None
-
         if not Config.api_key:
             reason = "No Gemini API key is set, so Gemini could not be called."
             self.log(reason, "warn")
         else:
             try:
-                clips = self.ask_gemini(job, title, duration, transcript_text)
-                self.finish_ai_step(job, title, clips)
-                return clips
+                return self.ask_gemini(job, title, duration, chunk["text"], part, required)
             except JobCancelled:
                 raise
             except Exception as exc:
                 reason = f"Gemini could not produce valid clips. {friendly_error(exc)}"
                 self.log(f"AI step failed: {reason}", "error")
+        return self.manual_gemini(job, title, duration, chunk["text"], reason, part, required)
 
-        clips = self.manual_gemini(job, title, duration, transcript_text, reason)
-        self.finish_ai_step(job, title, clips)
+    def step_ai_all(self, job, title, duration, chunks):
+        """'Skip the editor' mode: every transcript part, one after the other, without waiting for the user."""
+        self.set_step(2, "active")
+        clips = []
+        for chunk in chunks:
+            if job.cancel.is_set():
+                raise JobCancelled()
+            self.log(f"Transcript part {chunk['index'] + 1} of {len(chunks)} ({chunk_label(chunk)}).")
+            new = self.find_clips(job, title, duration, chunk, len(chunks))
+            for number, clip in enumerate(new, 1):
+                clip.rank = len(clips) + number
+            clips += new
+            self.log(f"Part {chunk['index'] + 1}: {len(new)} clips found, {len(clips)} in total.", "ok")
+        self.publish_clips(job, title, clips)
+        self.log(f"Transcript done: {len(chunks)} part{'s' if len(chunks) != 1 else ''} analysed, "
+                 f"{len(clips)} clips.", "ok")
+        self.set_step(2, "done")
+        self.set_progress(30)
         return clips
 
-    def finish_ai_step(self, job, title, clips):
+    def publish_clips(self, job, title, clips):
+        """Show the clips found so far in the Clips and JSON tabs."""
+        self.found_clips = list(clips)
         payload = {
             "video_title": title,
             "source_url": job.url,
-            "top_5_viral_clips": [c.to_json() for c in clips],
+            "viral_clips": [c.to_json() for c in clips],
         }
         self.events.put(("json", json.dumps(payload, ensure_ascii=False, indent=2)))
-        self.events.put(("clips", clips))
-        self.log(f"{len(clips)} clips ready.", "ok")
-        self.set_step(2, "done")
-        self.set_progress(30)
+        self.events.put(("clips", list(clips)))
 
-    def ask_gemini(self, job, title, duration, transcript_text):
+    def ask_gemini(self, job, title, duration, transcript_text, part=None, required=REQUIRED_CLIPS):
         rng = job.duration_range
+        window = (part["start"], part["end"]) if part else None
+        where = f" (part {part['index'] + 1} of {part['total']})" if part else ""
         feedback = None
         last_error = None
         for attempt in range(1, MAX_AI_ATTEMPTS + 1):
@@ -3703,14 +3972,14 @@ class ViralClipsApp(ctk.CTk):
                 raise JobCancelled()
             self.set_status(f"Asking Gemini… (attempt {attempt} of {MAX_AI_ATTEMPTS})")
             self.set_progress(20 + attempt * 2)
-            self.log(f"Sending the transcript to Gemini ({Config.model}), attempt {attempt}.")
+            self.log(f"Sending the transcript{where} to Gemini ({Config.model}), attempt {attempt}.")
             prompt = build_prompt(title, job.url, duration, rng, job.instructions,
-                                  transcript_text=transcript_text, feedback=feedback)
+                                  transcript_text=transcript_text, feedback=feedback, part=part, count=required)
             try:
                 text = call_gemini(prompt)
                 raw_clips = extract_raw_clips(text)
-                clips, problems = build_clips(raw_clips, duration, rng)
-                if len(clips) == REQUIRED_CLIPS:
+                clips, problems = build_clips(raw_clips, duration, rng, required=required, window=window)
+                if len(clips) == required:
                     return clips
                 feedback = " ".join(problems[:4]) or f"Only {len(clips)} usable clips were returned."
                 raise ValueError(feedback)
@@ -3728,13 +3997,17 @@ class ViralClipsApp(ctk.CTk):
                         raise JobCancelled()
         raise last_error or RuntimeError("Gemini did not return usable clips.")
 
-    def manual_gemini(self, job, title, duration, transcript_text, reason):
-        """Fallback: save transcript + prompt, let the user run Gemini chat, paste JSON back."""
+    def manual_gemini(self, job, title, duration, transcript_text, reason, part=None, required=REQUIRED_CLIPS):
+        """Fallback: save transcript + prompt, let the user run Gemini chat, paste JSON back.
+        With a transcript part, only that part is saved (folder '<title> - part N')."""
         rng = job.duration_range
-        folder = MANUAL_DIR / safe_name(title, 60)
+        window = (part["start"], part["end"]) if part else None
+        name = safe_name(title, 60) + (f" - part {part['index'] + 1}" if part else "")
+        folder = MANUAL_DIR / name
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "transcript.txt").write_text(transcript_text, encoding="utf-8")
-        prompt = build_prompt(title, job.url, duration, rng, job.instructions, transcript_text=None)
+        prompt = build_prompt(title, job.url, duration, rng, job.instructions, transcript_text=None,
+                              part=part, count=required)
         (folder / "prompt.txt").write_text(prompt, encoding="utf-8")
         self.log(f"Manual Gemini files saved in {folder}", "warn")
 
@@ -3743,14 +4016,14 @@ class ViralClipsApp(ctk.CTk):
                 raw_clips = extract_raw_clips(text)
             except ValueError as exc:
                 return None, str(exc)
-            clips, problems = build_clips(raw_clips, duration, rng)
-            if len(clips) == REQUIRED_CLIPS:
+            clips, problems = build_clips(raw_clips, duration, rng, required=required, window=window)
+            if len(clips) == required:
                 return clips, None
             if not clips:
                 return None, "No usable clips in that answer.\n" + "\n".join(problems[:5])
             if messagebox.askyesno(
                     "Some clips are not usable",
-                    f"{len(clips)} of {REQUIRED_CLIPS} clips are usable.\n\n" + "\n".join(problems[:5]) +
+                    f"{len(clips)} of {required} clips are usable.\n\n" + "\n".join(problems[:5]) +
                     "\n\nContinue with the usable clips only?\n"
                     "Choose No to ask Gemini again and paste a new answer.",
                     parent=parent):
@@ -3765,7 +4038,8 @@ class ViralClipsApp(ctk.CTk):
         return clips
 
     # review ---------------------------------------------------------------
-    def step_review(self, job, info, title, duration, clips):
+    def step_review(self, job, info, title, duration, chunks):
+        """Open the editor with NO clips yet: the AI is asked from inside the editor, one transcript part at a time."""
         video_path = None
         if job.download_first:  # download now, so the editor can play the file instead of YouTube
             self.events.put(("state", "running"))
@@ -3780,28 +4054,16 @@ class ViralClipsApp(ctk.CTk):
                 raise
             except Exception:
                 pass
-        parts = None
-        if not video_path and job.clip_parts_only and clips:
-            cached = self.video_cache
-            if cached and cached["key"] == (job.url, job.quality) and Path(cached["path"]).is_file():
-                video_path = cached["path"]  # the full video is already on disk - just use it
-            else:  # download ONLY the clip parts (clip + padding) now, so the editor can play them
-                self.events.put(("state", "running"))
-                self.set_step(3, "active")
-                self.set_status(f"Downloading only the clips (each with {SECTION_PAD}s before and after)…")
-                parts = self.ensure_parts(job, clips)
-                self.set_step(3, "done")
-                self.log("Editing from the downloaded clip parts.", "ok")
         waiter = Waiter()
         self.review_waiter = waiter
-        default_size = job.ratio
+        self.found_clips = []
         self.editor_session = EditorSession(
             info.get("id", ""), title, duration, info.get("playable_in_embed") is not False,
-            clips, default_size, video_path, parts)
+            [], job.ratio, video_path, None, chunks)
         self.events.put(("state", "review"))
         self.events.put(("open_editor", None))
-        self.set_status("Set each clip's time and size in the editor, then press 'Generate clips' there. "
-                        "(Or use 'Create selected clips' here to skip editing.)")
+        self.set_status("In the editor press 'Find clips' to send the first part of the transcript to the AI, "
+                        "then 'Find more clips' for the next parts. Press 'Generate clips' there when you are done.")
         self.log("Waiting for you in the clip editor.")
         return self.wait_for(waiter)
 
@@ -3863,6 +4125,14 @@ class ViralClipsApp(ctk.CTk):
             raise ValueError("The app is not waiting for the editor right now.")
         if session.task.get("name"):
             raise ValueError("Please wait, the app is still working on the video.")
+        if action == "find":
+            if session.more.get("busy"):
+                raise ValueError("The AI is already looking for clips.")
+            if session.next_chunk >= len(session.chunks):
+                raise ValueError("The whole transcript has been analysed already.")
+            session.more.update(busy=True, message="Starting…", error="")
+            threading.Thread(target=self._editor_find_worker, args=(session, job), daemon=True).start()
+            return
         if action == "download":
             if session.video_path or session.parts:
                 raise ValueError("The video is already downloaded.")
@@ -3875,6 +4145,82 @@ class ViralClipsApp(ctk.CTk):
             raise ValueError("Unknown action.")
         session.set_task(name=action, percent=0, message="Starting…", error="")
         threading.Thread(target=target, args=(session, job), daemon=True).start()
+
+    def _editor_find_worker(self, session, job):
+        """'Find clips' in the editor: send the NEXT transcript part to the AI, then add the clips to the editor."""
+        index = session.next_chunk
+        chunk, total = session.chunks[index], len(session.chunks)
+        label = chunk_label(chunk)
+        try:
+            self.set_step(2, "active")
+            self.log(f"Transcript part {index + 1} of {total} ({label}) goes to the AI.")
+            if session.pending and session.pending[0] == index:  # found before, only the download failed
+                new = session.pending[1]
+            else:
+                session.more.update(message=f"Asking the AI about part {index + 1} of {total} ({label})…")
+                new = self.find_clips(job, session.title, job.video_duration or session.duration, chunk, total)
+                for number, clip in enumerate(new, 1):
+                    clip.rank = len(session.clips) + number
+                session.pending = (index, new)
+            parts = None
+            cached = self.video_cache
+            have_full = bool(session.video_path or (cached and cached["key"] == (job.url, job.quality)
+                                                    and Path(cached["path"]).is_file()))
+            if job.clip_parts_only and not have_full:  # long video: download only these clips (+ padding)
+                session.more.update(message="Downloading only these clips (+10 s before and after)…")
+                self.set_step(3, "active")
+                parts = self.add_parts(job, session, new)
+                self.set_step(3, "done")
+            with session.lock:
+                session.clips.extend(new)
+                if parts is not None:
+                    session.parts = parts
+                    session.version += 1
+                session.next_chunk = index + 1
+                session.clips_version += 1
+                session.pending = None
+            self.publish_clips(job, session.title, session.clips)
+            finished = session.next_chunk >= total
+            self.log(f"Part {index + 1} of {total}: {len(new)} clips added, {len(session.clips)} in the editor."
+                     + (" Transcript done." if finished else ""), "ok")
+            self.set_step(2, "done")
+            session.more.update(busy=False, message="", error="")
+            self.set_status("Transcript done. Edit the clips, then press 'Generate clips' in the editor."
+                            if finished else
+                            f"{len(session.clips)} clips so far. Press 'Find more clips' in the editor for the next part.")
+        except JobCancelled:
+            session.more.update(busy=False, message="", error="Cancelled.")
+        except Exception as exc:
+            message = friendly_error(exc)
+            self.log(f"Finding clips in part {index + 1} failed: {message}", "error")
+            self.set_step(2, "failed")
+            session.more.update(busy=False, message="", error=message + " Press the button to try again.")
+
+    def add_parts(self, job, session, new_clips):
+        """Download only the parts of the video that the NEW clips need (+SECTION_PAD s each side) and add them to
+        the parts that are already downloaded. -> the complete, sorted list of parts"""
+        usable = fit_to_duration(new_clips, job.video_duration)[0] if job.video_duration else list(new_clips)
+        old = list(session.parts)
+        missing = [clip for clip in usable if not parts_cover(old, clip)]
+        ranges = plan_sections(missing, job.video_duration)
+        if usable and not ranges and not old:
+            raise UserFacingError("None of the new clips fit inside the video.")
+        added = []
+        if ranges:
+            wanted = sum(b - a for a, b in ranges)
+            self.log(f"Downloading only the new clips: {len(ranges)} part(s), {format_timestamp(wanted)} in total "
+                     f"(each clip with {SECTION_PAD}s before and after).")
+            for begin, finish in ranges:
+                self.log(f"  part {format_timestamp(begin)} to {format_timestamp(finish)}")
+            self.set_status("Downloading the clip parts…")
+            added, _info = download_clip_parts(job.url, job.quality, ranges, self.log, self.set_status,
+                                               self.set_progress, job.cancel)
+            self.log("Clip parts ready.", "ok")
+        merged = sorted(old + added, key=lambda part: part["start"])
+        with self.video_lock:
+            self.parts_cache = {"key": (job.url, job.quality, tuple((p["start"], p["end"]) for p in merged)),
+                                "parts": merged}
+        return merged
 
     def _editor_download(self, session, job):
         try:

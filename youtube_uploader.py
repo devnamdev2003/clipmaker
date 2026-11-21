@@ -2,9 +2,9 @@
 YouTube uploader for Viral Clips Studio
 =======================================
 
-Standalone module: main.py only calls  offer_youtube_upload(app, saved_clips)  once all clips are rendered.
-It asks "Do you want to upload these clips to YouTube?", lets you review/edit title + description,
-then uploads every selected clip to your channel with:
+Standalone module: main.py embeds make_upload_panel_class() as the "Upload" tab (step 6). Nothing is uploaded
+automatically: the tab lists the finished clips, lets you review/edit title + description, and only uploads
+when you press the Upload button. Every selected clip is uploaded to your channel with:
 
   * title + description + hashtags   -> taken from the Gemini post copy saved next to each clip
                                         (the per-clip .txt file); falls back to the clip's own title
@@ -445,7 +445,7 @@ def run_uploads(items, settings, notify, cancel=None):
 
 
 # --------------------------------------------------------------------------- #
-# Window shown inside Viral Clips Studio (customtkinter, same look as the app)
+# Upload tab shown inside Viral Clips Studio (customtkinter, same look as the app)
 # --------------------------------------------------------------------------- #
 BG, PANEL, RAISED, LINE = "#16181d", "#1f2229", "#272b34", "#343945"
 TEXT, SOFT, MUTED = "#e8e6e1", "#c3c7d1", "#8d93a0"
@@ -453,111 +453,293 @@ ACCENT, ACCENT_HOVER, ACCENT_TEXT = "#8b9bff", "#7686f0", "#10131c"
 GOOD, BAD, WARN = "#5fc9a0", "#ef6a6a", "#e8b04a"
 
 
-def _make_dialog_class():
+def attach_flow(frame, get_widgets, all_widgets, gap=8):
+    """Lay widgets out left to right and wrap them onto new rows when the frame is too narrow.
+    Returns relayout(): call it after the visible widgets change."""
+    state = {"width": -1}
+
+    def layout(_event=None):
+        width = frame.winfo_width()
+        if width < 40 or width == state["width"]:
+            return
+        state["width"] = width
+        for widget in all_widgets:
+            widget.grid_forget()
+        x = row = col = 0
+        for widget in get_widgets():
+            need = widget.winfo_reqwidth() + gap
+            if col and x + need > width:
+                row, col, x = row + 1, 0, 0
+            widget.grid(row=row, column=col, padx=(0, gap), pady=(0, 6), sticky="w")
+            x += need
+            col += 1
+
+    def relayout():
+        state["width"] = -1
+        layout()
+
+    frame.bind("<Configure>", layout, add="+")
+    return relayout
+
+
+def make_upload_panel_class():
     import tkinter as tk
+    from tkinter import filedialog, messagebox
     import customtkinter as ctk
 
     ui_font = "Segoe UI" if os.name == "nt" else None
 
-    def font(size=13, weight="normal"):
-        return ctk.CTkFont(family=ui_font, size=size, weight=weight)
+    def font(size=13, weight="normal", mono=False):
+        family = ("Consolas" if os.name == "nt" else "monospace") if mono else ui_font
+        return ctk.CTkFont(family=family, size=size, weight=weight)
 
-    class YouTubeUploadDialog(ctk.CTkToplevel):
-        def __init__(self, parent, items, settings):
-            super().__init__(parent)
-            self.items, self.settings = items, settings
+    def button(parent, text, command, primary=False, **kw):
+        if primary:
+            return ctk.CTkButton(parent, text=text, command=command, font=font(13, "bold"), fg_color=ACCENT,
+                                 hover_color=ACCENT_HOVER, text_color=ACCENT_TEXT, height=36, corner_radius=8, **kw)
+        return ctk.CTkButton(parent, text=text, command=command, font=font(13), fg_color=RAISED, hover_color=LINE,
+                             text_color=TEXT, height=36, corner_radius=8, **kw)
+
+    class UploadPanel(ctk.CTkScrollableFrame):
+        """The 'Upload' tab. Nothing is uploaded until the user presses the Upload button.
+        on_log(message, level) mirrors every line into the app's Log tab; on_step(state) drives the 6th step pill."""
+
+        def __init__(self, parent, on_log=None, on_step=None, initial_dir=None):
+            super().__init__(parent, fg_color="transparent")
+            self.on_log, self.on_step = on_log, on_step
+            self.initial_dir = Path(initial_dir) if initial_dir else BASE_DIR
+            self.settings = UploadSettings.from_env()
+            self.items, self.rows, self.entries = [], [], []
             self.events = queue.Queue()
             self.cancel = threading.Event()
-            self.worker = None
+            self.generation = 0  # events of an abandoned worker carry an old number and are ignored
             self.running = False
             self.alive = True
-            self.rows = []
-            self.uploaded = 0
-            self.total = 0
+            self.uploaded = self.total = 0
             self.fatal_shown = False
-
-            self.title("Upload to YouTube")
-            self.configure(fg_color=BG)
-            self.minsize(700, 520)
-            parent.update_idletasks()
-            width, height = 860, 740
-            x = parent.winfo_rootx() + max(0, (parent.winfo_width() - width) // 2)
-            y = parent.winfo_rooty() + max(0, (parent.winfo_height() - height) // 3)
-            self.geometry(f"{width}x{height}+{x}+{y}")
-            self.transient(parent)
-            self.protocol("WM_DELETE_WINDOW", self.on_close)
+            self.milestones = {}
             self.grid_columnconfigure(0, weight=1)
-            self.grid_rowconfigure(1, weight=1)
 
             head = ctk.CTkFrame(self, fg_color="transparent")
-            head.grid(row=0, column=0, sticky="ew", padx=24, pady=(18, 4))
-            ctk.CTkLabel(head, text="Upload your clips to YouTube", font=font(20, "bold"), text_color=TEXT,
+            head.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 0))
+            ctk.CTkLabel(head, text="Upload your clips to YouTube", font=font(18, "bold"), text_color=TEXT,
                          anchor="w").pack(anchor="w")
-            ctk.CTkLabel(head, text="Titles, descriptions and hashtags come from the post copy written for each "
-                                    "clip. Edit anything, untick clips you do not want, then press Upload.",
-                         font=font(12), text_color=MUTED, anchor="w", justify="left",
-                         wraplength=780).pack(anchor="w", pady=(2, 0))
+            self.intro = ctk.CTkLabel(
+                head, text="Nothing is uploaded automatically. Review the titles and descriptions, untick any clip "
+                           "you do not want, then press Upload.", font=font(12), text_color=MUTED, anchor="w",
+                justify="left", wraplength=520)
+            self.intro.pack(anchor="w", pady=(2, 0))
 
-            self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
-            self.scroll.grid(row=1, column=0, sticky="nsew", padx=(18, 12), pady=(6, 0))
-            self.scroll.grid_columnconfigure(0, weight=1)
-            for item in items:
-                self._build_row(item)
+            setup = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=10)
+            setup.grid(row=1, column=0, sticky="ew", padx=6, pady=(10, 0))
+            setup.grid_columnconfigure(0, weight=1)
+            self.setup_label = ctk.CTkLabel(setup, text="", anchor="w", justify="left", font=font(12),
+                                            text_color=SOFT, wraplength=420)
+            self.setup_label.grid(row=0, column=0, sticky="ew", padx=12, pady=10)
+            self.help_btn = button(setup, "Setup help", self.show_setup_help, width=100)
+            self.help_btn.configure(height=30)
+            self.help_btn.grid(row=0, column=1, padx=(0, 10), pady=8)
 
-            bar = ctk.CTkFrame(self, fg_color="transparent")
-            bar.grid(row=2, column=0, sticky="ew", padx=24, pady=(10, 0))
-            ctk.CTkLabel(bar, text="Visibility", font=font(12), text_color=SOFT).pack(side="left")
-            self.privacy_var = tk.StringVar(value=settings.privacy)
+            self.list_frame = ctk.CTkFrame(self, fg_color="transparent")
+            self.list_frame.grid(row=2, column=0, sticky="ew", padx=0, pady=(10, 0))
+            self.list_frame.grid_columnconfigure(0, weight=1)
+            self.empty_label = ctk.CTkLabel(
+                self.list_frame, text_color=MUTED, font=font(13), justify="center",
+                text="No clips loaded yet.\nCreate clips first, or press “Load clips from folder”.")
+
+            opts = ctk.CTkFrame(self, fg_color="transparent")
+            opts.grid(row=3, column=0, sticky="ew", padx=6, pady=(4, 0))
+            ctk.CTkLabel(opts, text="Visibility", font=font(12), text_color=SOFT).pack(side="left")
+            self.privacy_var = tk.StringVar(value=self.settings.privacy)
             self.privacy_menu = ctk.CTkOptionMenu(
-                bar, values=PRIVACY_CHOICES, variable=self.privacy_var, width=120, font=font(12),
+                opts, values=PRIVACY_CHOICES, variable=self.privacy_var, width=120, font=font(12),
                 fg_color=RAISED, button_color=RAISED, button_hover_color=LINE, text_color=TEXT)
-            self.privacy_menu.pack(side="left", padx=(8, 18))
-            self.notify_var = tk.BooleanVar(value=settings.notify_subscribers)
+            self.privacy_menu.pack(side="left", padx=(8, 16))
+            self.notify_var = tk.BooleanVar(value=self.settings.notify_subscribers)
             self.notify_check = ctk.CTkCheckBox(
-                bar, text="Notify subscribers", variable=self.notify_var, font=font(12), text_color=SOFT,
+                opts, text="Notify subscribers", variable=self.notify_var, font=font(12), text_color=SOFT,
                 fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=MUTED)
             self.notify_check.pack(side="left")
 
-            self.progress = ctk.CTkProgressBar(self, progress_color=ACCENT, fg_color=RAISED)
+            self.progress = ctk.CTkProgressBar(self, progress_color=ACCENT, fg_color=RAISED, height=8)
             self.progress.set(0)
-            self.progress.grid(row=3, column=0, sticky="ew", padx=26, pady=(12, 0))
-            self.summary = ctk.CTkLabel(self, text="", anchor="w", justify="left", wraplength=800, font=font(13),
+            self.progress.grid(row=4, column=0, sticky="ew", padx=8, pady=(12, 0))
+            self.summary = ctk.CTkLabel(self, text="", anchor="w", justify="left", wraplength=520, font=font(13),
                                         text_color=MUTED)
-            self.summary.grid(row=4, column=0, sticky="ew", padx=26, pady=(6, 0))
+            self.summary.grid(row=5, column=0, sticky="ew", padx=8, pady=(6, 0))
 
-            buttons = ctk.CTkFrame(self, fg_color="transparent")
-            buttons.grid(row=5, column=0, sticky="ew", padx=24, pady=(10, 18))
-            self.upload_btn = ctk.CTkButton(buttons, text="Upload to YouTube", command=self.start, font=font(13, "bold"),
-                                            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ACCENT_TEXT,
-                                            height=36)
-            self.upload_btn.pack(side="left")
-            self.studio_btn = ctk.CTkButton(buttons, text="Open YouTube Studio", command=lambda: webbrowser.open(STUDIO_URL),
-                                            font=font(13), fg_color=RAISED, hover_color=LINE, text_color=TEXT, height=36)
-            self.studio_btn.pack(side="left", padx=(10, 0))
-            self.close_btn = ctk.CTkButton(buttons, text="Not now", command=self.on_close, font=font(13),
-                                           fg_color="transparent", hover_color=RAISED, text_color=SOFT, height=36)
-            self.close_btn.pack(side="right")
+            bar = ctk.CTkFrame(self, fg_color="transparent")
+            bar.grid(row=6, column=0, sticky="ew", padx=6, pady=(8, 0))
+            self.upload_btn = button(bar, "Upload to YouTube", self.start, primary=True)
+            self.cancel_btn = button(bar, "Cancel upload", self.cancel_upload)
+            self.folder_btn = button(bar, "Load clips from folder…", self.choose_folder)
+            self.reload_btn = button(bar, "Reload titles", self.reload)
+            self.studio_btn = button(bar, "Open YouTube Studio", lambda: webbrowser.open(STUDIO_URL))
+            self.buttons = [self.upload_btn, self.cancel_btn, self.folder_btn, self.reload_btn, self.studio_btn]
+            attach_flow(bar, lambda: self.buttons, self.buttons)
+            self.cancel_btn.configure(state="disabled")
 
-            if not any(r["item"].selected for r in self.rows):
-                self.upload_btn.configure(state="disabled")
-                self.summary.configure(text="All clips in this folder are already uploaded.", text_color=GOOD)
-            self.after(200, self._take_focus)
+            ctk.CTkLabel(self, text="Upload log", font=font(12, "bold"), text_color=SOFT, anchor="w").grid(
+                row=7, column=0, sticky="w", padx=8, pady=(12, 2))
+            self.log_box = ctk.CTkTextbox(self, height=170, fg_color=BG, text_color=SOFT, font=font(12, mono=True),
+                                          wrap="word", state="disabled", border_width=1, border_color=LINE)
+            self.log_box.grid(row=8, column=0, sticky="ew", padx=6, pady=(0, 10))
+            self.log_box.tag_config("warn", foreground=WARN)
+            self.log_box.tag_config("error", foreground=BAD)
+            self.log_box.tag_config("ok", foreground=GOOD)
+
+            self.bind("<Configure>", self._resize, add="+")
+            self.refresh_setup(log=True)
+            self.log("Upload tab ready. Clips from a finished job appear here; nothing is uploaded until you press "
+                     "Upload.")
+            self._show_empty()
             self.after(100, self._poll)
 
-        def _take_focus(self):
+        # ---------------------------------------------------------- helpers
+        def _resize(self, event):
+            wrap = max(260, event.width - 60)
+            for label in (self.intro, self.summary):
+                label.configure(wraplength=wrap)
+            self.setup_label.configure(wraplength=max(200, wrap - 120))
+
+        def destroy(self):
+            self.alive = False
+            super().destroy()
+
+        def log(self, message, level="info"):
+            stamp = time.strftime("%H:%M:%S")
+            tag = {"warn": "warn", "error": "error", "ok": "ok"}.get(level)
             try:
-                self.lift()
-                self.focus_force()
-                self.grab_set()
+                self.log_box.configure(state="normal")
+                if tag:
+                    self.log_box.insert("end", f"{stamp}  {message}\n", tag)
+                else:
+                    self.log_box.insert("end", f"{stamp}  {message}\n")
+                self.log_box.see("end")
+                self.log_box.configure(state="disabled")
             except tk.TclError:
-                pass
+                return
+            if self.on_log:
+                self.on_log(f"[Upload] {message}", level)
+
+        def step(self, state):
+            if self.on_step:
+                self.on_step(state)
+
+        def check_setup(self):
+            missing = missing_dependencies()
+            if missing:
+                return False, f"Missing Python packages: {', '.join(missing)}.  Run:  {PIP_COMMAND}"
+            if find_client_secret() is None and not TOKEN_FILE.exists():
+                return False, ("Google setup needed: client_secret.json was not found next to the app. "
+                               "Press “Setup help” for the one-time steps.")
+            if TOKEN_FILE.exists():
+                return True, "Google login saved. Ready to upload."
+            return True, "client_secret.json found. A browser window opens to sign in the first time you upload."
+
+        def refresh_setup(self, log=False):
+            ok, text = self.check_setup()
+            self.setup_label.configure(text=("✓ " if ok else "⚠ ") + text, text_color=GOOD if ok else WARN)
+            if log:
+                self.log(f"Setup check: {text}", "ok" if ok else "warn")
+            return ok
+
+        def show_setup_help(self):
+            self.refresh_setup(log=True)
+            messagebox.showinfo("YouTube setup", SETUP_HELP + f"\n\nPackages:  {PIP_COMMAND}")
+
+        def _show_empty(self):
+            self.empty_label.grid(row=0, column=0, pady=40)
+
+        def _set_editable(self, editable):
+            state = "normal" if editable else "disabled"
+            for widget in (self.privacy_menu, self.notify_check):
+                widget.configure(state=state)
+            for row in self.rows:
+                if row["item"].video_id:
+                    row["check"].configure(state="disabled")
+                    continue
+                for key in ("check", "title", "desc"):
+                    row[key].configure(state=state)
+
+        # ----------------------------------------------------------- loading
+        def clear(self):
+            """Forget the loaded clips (used by 'New video'). Does nothing while an upload is running."""
+            if self.running:
+                return
+            self._populate([], [], announce=False)
+            self.progress.set(0)
+            self.summary.configure(text="")
+            self.step("pending")
+
+        def load(self, saved, source=""):
+            """saved = [(clip, mp4 path), ...] or plain paths. Rows are only filled in: nothing is uploaded."""
+            if self.running:
+                self.log("An upload is running right now; the new clips were not loaded here.", "warn")
+                return
+            entries = list(saved)
+            self._populate(entries, build_items(entries), source=source)
+
+        def reload(self):
+            if self.running:
+                return
+            if not self.entries:
+                self.log("Nothing to reload yet. Create clips or load a folder first.", "warn")
+                return
+            self.log("Reloading titles and descriptions from the saved post files…")
+            self.load(self.entries)
+
+        def choose_folder(self):
+            if self.running:
+                return
+            start = self.initial_dir if self.initial_dir.is_dir() else BASE_DIR
+            folder = filedialog.askdirectory(parent=self.winfo_toplevel(), initialdir=str(start),
+                                             title="Choose the folder with your .mp4 clips")
+            if not folder:
+                return
+            paths = sorted(Path(folder).glob("*.mp4"))
+            if not paths:
+                self.log(f"No .mp4 files found in {folder}", "warn")
+                self.summary.configure(text="That folder has no .mp4 files.", text_color=WARN)
+                return
+            self.load(paths, source=folder)
+
+        def _populate(self, entries, items, announce=True, source=""):
+            for row in self.rows:
+                row["card"].destroy()
+            self.rows, self.entries, self.items = [], entries, items
+            self.progress.set(0)
+            self.empty_label.grid_forget()
+            for item in items:
+                self._build_row(item)
+            waiting = [i for i in items if i.selected]
+            if not items:
+                self._show_empty()
+                self.upload_btn.configure(state="disabled")
+                if announce:
+                    self.summary.configure(text="No clips found to upload.", text_color=WARN)
+                    self.log("No clips found to upload.", "warn")
+                return
+            self.upload_btn.configure(state="normal" if waiting else "disabled", text="Upload to YouTube")
+            where = f" from {source}" if source else ""
+            if waiting:
+                text = (f"{len(waiting)} clip{'s' if len(waiting) != 1 else ''} ready to upload. "
+                        "Check the titles, then press Upload to YouTube.")
+                self.summary.configure(text=text, text_color=SOFT)
+            else:
+                self.summary.configure(text="All clips in this list are already uploaded.", text_color=GOOD)
+            self.log(f"Loaded {len(items)} clip{'s' if len(items) != 1 else ''}{where}: {len(waiting)} waiting, "
+                     f"{len(items) - len(waiting)} already uploaded.", "ok")
+            for item in items:
+                self.log(f"  {item.path.name}  |  {item.status}  |  “{item.title}”")
+            self.step("pending")
 
         def _build_row(self, item):
-            card = ctk.CTkFrame(self.scroll, fg_color=PANEL, corner_radius=10)
-            card.grid(row=len(self.rows), column=0, sticky="ew", pady=(0, 10))
+            card = ctk.CTkFrame(self.list_frame, fg_color=PANEL, corner_radius=10)
+            card.grid(row=len(self.rows), column=0, sticky="ew", pady=(0, 10), padx=(0, 4))
             card.grid_columnconfigure(0, weight=1)
             top = ctk.CTkFrame(card, fg_color="transparent")
-            top.grid(row=0, column=0, sticky="ew", padx=14, pady=(10, 4))
+            top.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
             top.grid_columnconfigure(1, weight=1)
             var = tk.BooleanVar(value=item.selected)
             check = ctk.CTkCheckBox(top, text="", variable=var, width=24, fg_color=ACCENT, hover_color=ACCENT_HOVER,
@@ -567,22 +749,26 @@ def _make_dialog_class():
                 row=0, column=1, sticky="w")
             status = ctk.CTkLabel(top, text=item.status, font=font(12), text_color=GOOD if item.video_id else MUTED,
                                   anchor="e", cursor="hand2" if item.video_id else "")
-            status.grid(row=0, column=2, sticky="e")
+            status.grid(row=0, column=2, sticky="e", padx=(6, 0))
             if item.video_id:
                 status.bind("<Button-1>", lambda _e, u=item.url: webbrowser.open(u))
             title = ctk.CTkEntry(card, font=font(13), fg_color=RAISED, border_color=LINE, text_color=TEXT)
             title.insert(0, item.title)
-            title.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 6))
-            desc = ctk.CTkTextbox(card, height=96, font=font(12), fg_color=RAISED, border_color=LINE,
+            title.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
+            desc = ctk.CTkTextbox(card, height=84, font=font(12), fg_color=RAISED, border_color=LINE,
                                   border_width=1, text_color=TEXT, wrap="word")
             desc.insert("1.0", item.description)
-            desc.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 12))
+            desc.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
             self.rows.append({"item": item, "var": var, "check": check, "title": title, "desc": desc,
-                              "status": status})
+                              "status": status, "card": card})
 
         # ------------------------------------------------------------ actions
         def start(self):
             if self.running:
+                return
+            if not self.refresh_setup():
+                self.summary.configure(text="Upload is not set up yet. Press “Setup help”.", text_color=BAD)
+                self.log("Cannot upload: " + self.setup_label.cget("text").lstrip("⚠ "), "error")
                 return
             chosen = []
             for row in self.rows:
@@ -594,38 +780,62 @@ def _make_dialog_class():
                     chosen.append(item)
             if not chosen:
                 self.summary.configure(text="Tick at least one clip to upload.", text_color=WARN)
+                self.log("Nothing ticked: tick at least one clip to upload.", "warn")
                 return
             self.settings.privacy = self.privacy_var.get()
             self.settings.notify_subscribers = bool(self.notify_var.get())
             self.running = True
-            self.uploaded = 0
-            self.fatal_shown = False
-            self.total = len(chosen)
-            self.cancel.clear()
-            for widget in (self.upload_btn, self.privacy_menu, self.notify_check):
-                widget.configure(state="disabled")
-            for row in self.rows:
-                row["check"].configure(state="disabled")
-                row["title"].configure(state="disabled")
-                row["desc"].configure(state="disabled")
-            self.close_btn.configure(text="Cancel")
+            self.uploaded, self.total, self.fatal_shown = 0, len(chosen), False
+            self.milestones = {}
+            self.generation += 1
+            self.cancel = threading.Event()
+            self._set_editable(False)
+            self.upload_btn.configure(state="disabled")
+            self.cancel_btn.configure(state="normal")
+            self.folder_btn.configure(state="disabled")
+            self.reload_btn.configure(state="disabled")
             self.progress.set(0)
             self.summary.configure(text="Starting…", text_color=MUTED)
-            self.worker = threading.Thread(target=self._work, daemon=True)
-            self.worker.start()
+            self.step("active")
+            self.log(f"Starting upload of {self.total} clip{'s' if self.total != 1 else ''} "
+                     f"(visibility: {self.settings.privacy}, notify subscribers: "
+                     f"{'yes' if self.settings.notify_subscribers else 'no'}).")
+            threading.Thread(target=self._work, args=(self.generation, self.cancel), daemon=True).start()
 
-        def _work(self):
-            run_uploads(self.items, self.settings, lambda kind, item, value: self.events.put((kind, item, value)),
-                        self.cancel)
+        def _work(self, generation, cancel):
+            run_uploads(self.items, self.settings,
+                        lambda kind, item, value: self.events.put((generation, kind, item, value)), cancel)
+
+        def cancel_upload(self):
+            if not self.running:
+                return
+            self.cancel.set()  # stops after the chunk that is uploading right now
+            self.cancel_btn.configure(state="disabled")
+            self.summary.configure(text="Cancelling after the current chunk…", text_color=WARN)
+            self.log("Cancel requested. Stopping after the current chunk.", "warn")
+            generation = self.generation
+            self.after(2500, lambda: self._force_stop(generation))
+
+        def _force_stop(self, generation):
+            # The worker could be waiting for a Google sign-in in the browser, which cannot be interrupted.
+            # Never wait for it: let the UI go on and ignore anything that old worker reports later.
+            if not self.alive or generation != self.generation or not self.running:
+                return
+            self.generation += 1
+            self._end_run(cancelled=True)
 
         def _poll(self):
             if not self.alive:
                 return
             try:
                 while True:
-                    self._handle(*self.events.get_nowait())
+                    generation, kind, item, value = self.events.get_nowait()
+                    if generation == self.generation:
+                        self._handle(kind, item, value)
             except queue.Empty:
                 pass
+            except tk.TclError:
+                return
             self.after(100, self._poll)
 
         def _set_status(self, item, text, color):
@@ -634,107 +844,71 @@ def _make_dialog_class():
         def _handle(self, kind, item, value):
             if kind == "auth":
                 self.summary.configure(text=value, text_color=MUTED)
+                self.log(str(value))
             elif kind == "start":
                 self._set_status(item, "Uploading… 0%", ACCENT)
-                position = self.uploaded + 1
-                self.summary.configure(text=f"Uploading clip {position} of {self.total}: {item.title}",
-                                       text_color=MUTED)
+                self.summary.configure(
+                    text=f"Uploading clip {self.uploaded + 1} of {self.total}: {item.title}", text_color=MUTED)
+                size = item.path.stat().st_size / (1024 * 1024) if item.path.exists() else 0
+                self.log(f"Uploading {item.path.name} ({size:.1f} MB) as “{item.title}”…")
             elif kind == "progress":
                 self._set_status(item, f"Uploading… {int(value * 100)}%", ACCENT)
                 self.progress.set((self.uploaded + value) / max(1, self.total))
+                mark = int(value * 4)
+                if 0 < mark < 4 and mark > self.milestones.get(item.index, 0):
+                    self.milestones[item.index] = mark
+                    self.log(f"  {item.path.name}: {mark * 25}% sent")
             elif kind == "done":
                 self.uploaded += 1
                 self._set_status(item, "Uploaded - click to open", GOOD)
                 self.rows[item.index]["status"].configure(cursor="hand2")
                 self.rows[item.index]["status"].bind("<Button-1>", lambda _e, u=value: webbrowser.open(u))
                 self.progress.set(self.uploaded / max(1, self.total))
+                self.log(f"Uploaded {item.path.name}: {value}", "ok")
             elif kind == "error":
                 self._set_status(item, str(value)[:90], BAD)
+                self.log(f"FAILED {item.path.name}: {value}", "error")
             elif kind == "fatal":
                 self.fatal_shown = True
                 self.summary.configure(text=value, text_color=BAD)
+                self.log(str(value), "error")
             elif kind == "finished":
-                self.running = False
-                failed = self.total - self.uploaded
-                if self.uploaded and not failed:
-                    privacy = self.settings.privacy
-                    note = " They are private: open YouTube Studio to make them public." if privacy == "private" else ""
-                    self.summary.configure(text=f"All {self.uploaded} clips uploaded ({privacy}).{note}",
-                                           text_color=GOOD)
-                elif not self.fatal_shown:
-                    self.summary.configure(text=f"Uploaded {self.uploaded} of {self.total}. See the red lines above.",
-                                           text_color=WARN if self.uploaded else BAD)
-                self.close_btn.configure(text="Close")
-                if failed:
-                    self.upload_btn.configure(state="normal", text="Retry failed clips")
-                    for row in self.rows:
-                        if not row["item"].video_id:
-                            row["check"].configure(state="normal")
-                            row["title"].configure(state="normal")
-                            row["desc"].configure(state="normal")
-                    self.privacy_menu.configure(state="normal")
-                    self.notify_check.configure(state="normal")
+                self._end_run(cancelled=self.cancel.is_set())
 
-        def on_close(self):
-            if self.running:
-                self.cancel.set()  # stops after the chunk that is uploading right now
-                self.summary.configure(text="Cancelling after the current chunk…", text_color=WARN)
-                self.close_btn.configure(state="disabled")
-                # the worker is a daemon thread: it stops by itself at the next chunk (or when the app closes),
-                # so never wait for it - a pending Google sign-in in the browser could take forever
-                self.after(1500, self._finish)
-                return
-            self._finish()
+        def _end_run(self, cancelled=False):
+            self.running = False
+            failed = self.total - self.uploaded
+            privacy = self.settings.privacy
+            if cancelled:
+                text = f"Upload cancelled. {self.uploaded} of {self.total} uploaded."
+                self.summary.configure(text=text, text_color=WARN)
+                self.log(text, "warn")
+                self.step("pending" if not self.uploaded else "done")
+            elif self.uploaded and not failed:
+                note = " They are private: open YouTube Studio to make them public." if privacy == "private" else ""
+                text = f"All {self.uploaded} clip{'s' if self.uploaded != 1 else ''} uploaded ({privacy}).{note}"
+                self.summary.configure(text=text, text_color=GOOD)
+                self.log(text, "ok")
+                self.step("done")
+            else:
+                if not self.fatal_shown:
+                    self.summary.configure(
+                        text=f"Uploaded {self.uploaded} of {self.total}. See the red lines in the log.",
+                        text_color=WARN if self.uploaded else BAD)
+                self.log(f"Upload finished: {self.uploaded} of {self.total} uploaded, {failed} failed.",
+                         "warn" if self.uploaded else "error")
+                self.step("failed")
+            self.cancel_btn.configure(state="disabled")
+            self.folder_btn.configure(state="normal")
+            self.reload_btn.configure(state="normal")
+            self._set_editable(True)
+            waiting = [r for r in self.rows if not r["item"].video_id]
+            self.upload_btn.configure(state="normal" if waiting else "disabled",
+                                      text="Retry remaining clips" if waiting and self.uploaded + failed else
+                                      "Upload to YouTube")
+            self.refresh_setup()
 
-        def _finish(self):
-            self.alive = False
-            try:
-                self.grab_release()
-            except tk.TclError:
-                pass
-            try:
-                self.destroy()
-            except tk.TclError:
-                pass
-
-    return YouTubeUploadDialog
-
-
-def offer_youtube_upload(parent, saved, ask=True):
-    """Call this once the clips are rendered. saved = [(clip, mp4_path), ...] (or just paths).
-    Asks "upload to YouTube?", then opens the review + upload window. Blocks until that window is closed."""
-    from tkinter import messagebox
-
-    try:
-        items = build_items(saved)
-        if not items:
-            return
-        waiting = [i for i in items if i.selected]
-        if ask:
-            if not waiting:
-                return  # everything was uploaded before
-            if not messagebox.askyesno(
-                    "Upload to YouTube?",
-                    f"{len(waiting)} clip{'s are' if len(waiting) != 1 else ' is'} ready.\n\n"
-                    "Do you want to upload them to your YouTube channel now?\n"
-                    "You can check the titles and descriptions first.", parent=parent):
-                return
-        missing = missing_dependencies()
-        if missing:
-            messagebox.showinfo("One more install needed",
-                                "YouTube upload needs a few extra Python packages. Run this in a terminal, "
-                                f"then try again:\n\n{PIP_COMMAND}", parent=parent)
-            return
-        if find_client_secret() is None and not TOKEN_FILE.exists():
-            messagebox.showinfo("YouTube setup needed", SETUP_HELP, parent=parent)
-            return
-        dialog = _make_dialog_class()(parent, items, UploadSettings.from_env())
-        parent.wait_window(dialog)
-    except Exception as exc:  # never let the uploader break the main app
-        try:
-            messagebox.showerror("YouTube upload", f"The upload window could not open:\n{exc}", parent=parent)
-        except Exception:
-            print(f"YouTube upload error: {exc}", file=sys.stderr)
+    return UploadPanel
 
 
 # --------------------------------------------------------------------------- #

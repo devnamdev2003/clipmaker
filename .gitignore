@@ -7,3 +7,5 @@ output/
 downloads/
 manual_gemini/
 previews/
+__pycache__/
+__pycache__/

@@ -9,7 +9,7 @@ Turn any long YouTube video into **5 ready-to-post short clips** for YouTube Sho
 
 ## Features
 
-- **AI Viral Moment Detection (Gemini):** Fetches YouTube captions automatically and uses Google Gemini to pick the top 5 hooks/punchlines matching your chosen clip length and custom instructions.
+- **AI Viral Moment Detection (Gemini), part by part:** Fetches YouTube captions automatically and uses Google Gemini to pick the best 5 hooks/punchlines per transcript part, matching your chosen clip length and custom instructions. Long transcripts are not sent in one go: the first ~35 minutes go first, and you press **Find more clips** in the editor for the next part. A long video can therefore give you more than 5 clips.
 - **Never Stops on API Errors (Manual Fallback):** Missing an API key, out of quota, or network hiccup? The app saves `transcript.txt` and `prompt.txt` automatically so you can run the prompt in the Gemini web chat and paste the JSON answer right back in.
 - **Interactive Clip Editor:** Fine-tune start/end times, output dimensions, framing, and text overlays before rendering. Opens in your default browser—or as a native desktop window if `pywebview` is installed.
 - **Smart Download for Long Videos (20+ min):** Instead of downloading an entire 2-hour video, the app downloads **only the AI-selected clip segments plus 10 seconds of padding** before and after each clip. Shorter videos stream directly from YouTube during editing.
@@ -17,7 +17,8 @@ Turn any long YouTube video into **5 ready-to-post short clips** for YouTube Sho
   - Choose `9:16`, `16:9`, `1:1`, `4:5`, `Original`, or custom dimensions and drag the crop box directly over the video.
   - Switch to **Split: top + bottom** to stack two different parts of the video (e.g., speaker + screen/reaction) into one vertical clip with independent zoom, framing, and adjustable split height.
 - **Text Overlays (English, Hindi & Emojis):** Add up to 10 styled text layers per clip with custom fonts, outlines, rounded background boxes, timing (`from` / `to` seconds), and drag-and-drop placement on the live output preview.
-- **One-Click YouTube Upload:** When your clips are ready, the app asks *"Upload to YouTube?"*. Review or edit each clip's title and description, choose private / unlisted / public, and upload them all to your channel (with tags, `#Shorts`, and your chosen category). Already-uploaded clips are never uploaded twice. All upload code lives in the separate file `youtube_uploader.py`.
+- **YouTube Upload tab (step 6):** Nothing is uploaded automatically. When your clips are ready they are listed in the **Upload** tab (also the 6th step above the tabs). Review or edit each clip's title and description, choose private / unlisted / public, then press **Upload to YouTube**. The tab has its own **Upload log** (also mirrored into the Log tab), a setup check, and can load any folder of `.mp4` clips later. Already-uploaded clips are never uploaded twice. All upload code lives in `youtube_uploader.py`.
+- **Works on small screens:** the left settings panel, the Upload tab and the Clip Editor's video panel all scroll, the step bar and buttons wrap, and dialogs are resizable and never taller than your screen.
 - **Auto-Generated Post Copy:** Writes YouTube titles, descriptions, hashtags, and Instagram captions for all clips in a single Gemini call, with one-click Copy buttons and automatic saving to `posts.txt`.
 
 ---
@@ -138,19 +139,23 @@ python main.py
      - **Skip the editor:** Cuts the AI-selected clips immediately without opening the editor.
 3. Click **Analyze video**.
 
-### Step 2: Transcript & AI Analysis
+### Step 2: Transcript, then the editor opens
 
 - The app fetches video metadata and YouTube captions automatically.
 - If a video has no captions, a dialog lets you upload a `.vtt`, `.srt`, or `.txt` file, or paste YouTube's **"Show transcript"** text directly.
-- Gemini analyzes the transcript and returns the top 5 viral clips.
-  - *If the Gemini API fails or no key is set*, the **Finish with Gemini chat** window opens with one-click buttons to open Gemini, locate `transcript.txt`, copy the prompt, and paste the JSON response back in.
+- The transcript is split into parts of about 35 minutes (a very short last part is joined to the part before it). The **Clip Editor opens right away, with no clips yet**.
+- In the editor press **Find clips in part 1**. Only that part of the transcript goes to Gemini. The clips appear in the editor (for long videos only those clips, +10 s each side, are downloaded).
+- Press **Find more clips from part 2** (3, 4 …) whenever you want more. Each press sends only the next part, and the new clips are added below the ones you already have. When the last part is done the editor shows **✓ Transcript done**.
+- You can press **Generate clips** at any time. If transcript parts are left, the editor asks you to confirm first.
+  - *If the Gemini API fails or no key is set*, the **Finish with Gemini chat** window opens for that part with one-click buttons to open Gemini, locate `transcript.txt`, copy the prompt, and paste the JSON response back in.
+  - With **Skip the editor** switched on, all parts are sent one after another automatically.
 
 <!-- Replace with a screenshot of the Manual Gemini fallback dialog (optional) -->
 <!-- ![Manual Gemini Fallback](./assets/screenshots/3.png) -->
 
 ### Step 3: Fine-Tune in the Clip Editor
 
-Once the 5 clips are ready, the **Clip Editor** opens automatically:
+Use the **Clip Editor** to find and fine-tune your clips:
 
 <!-- Replace with a screenshot of the interactive Clip Editor -->
 ![Clip Editor](screenshots/clip-editor.png)
@@ -160,6 +165,7 @@ Once the 5 clips are ready, the **Clip Editor** opens automatically:
 - **Split Screen (Top + Bottom):** Change **Layout** to `Split: top + bottom`. Drag the **blue TOP** frame and **gold BOTTOM** frame to two different areas of the video, adjust per-panel zoom (or set a panel to `Full video (fit)`), and slide the **Split** ratio.
 - **Add Text Overlays:** Click **+ Add text** on any clip to add titles, hooks, or subtitles (Hindi & emojis supported). Customize font, size, color, outline, background box, and display timing (`from` / `to` seconds). Drag the text directly on the **Output preview** to position it.
 - **Instant Single-Clip Export:** Click **Download this clip** on any card to render and save that clip immediately while keeping the editor open.
+- **Find clips part by part:** the panel at the top of the clip list (and the button next to **Generate clips**) finds clips in the next transcript part. You can end up with more than 5 clips.
 - **Render All:** Uncheck any clips you don't want, then click **Generate clips**.
 
 <!-- Replace with a screenshot showing Split Screen + Text Overlay preview -->
@@ -176,12 +182,13 @@ Once the 5 clips are ready, the **Clip Editor** opens automatically:
 
 ### Step 5: Upload to YouTube (optional)
 
-- When the clips are finished, a popup asks **"Upload to YouTube?"** Click **Yes**.
-- In the upload window you can:
+- When the clips are finished they appear in the **Upload** tab (step 6). No popup, and nothing is uploaded until you press the button.
+- In the Upload tab you can:
   - untick clips you do not want to upload,
   - edit each clip's **title** and **description**,
-  - choose **private / unlisted / public** and whether to **notify subscribers**.
-- Click **Upload to YouTube**. Each clip shows its progress and, when done, a link to open the video. If a clip fails, fix the problem and press **Retry failed clips**.
+  - choose **private / unlisted / public** and whether to **notify subscribers**,
+  - press **Load clips from folder…** to upload clips from an earlier run, or **Reload titles** after writing new post copy.
+- Click **Upload to YouTube**. Each clip shows its progress and, when done, a link to open the video. The **Upload log** at the bottom of the tab records sign-in, every clip, progress, errors and the final result (the same lines also appear in the Log tab). If a clip fails, fix the problem and press **Retry remaining clips**.
 - Titles, descriptions and hashtags come from the post copy written for each clip. Tags are built from the hashtags, and `#Shorts` is added for vertical clips.
 - You can also upload later from a terminal:
 
@@ -220,7 +227,7 @@ When you run the app, it automatically creates these folders next to `main.py`:
 - **Browser cannot play the downloaded video:** Click **Make a smaller preview copy** in the editor bar to generate a browser-compatible H.264 preview (your final clips are still cut from the full-quality download).
 - **Age-restricted or "Not a bot" error:** Open **Settings**, choose the browser where you are signed into YouTube under **Browser cookies**, and close that browser before retrying if Windows locks its cookie database.
 - **"Access blocked: ... has not completed the Google verification process" (Error 403: access_denied):** Add your Google account under **Google Auth Platform → Audience → Test users** in the same Cloud project your `client_secret.json` came from, wait a couple of minutes, and sign in again.
-- **No "Upload to YouTube?" popup:** Make sure `youtube_uploader.py` is in the same folder as `main.py` and restart the app. To upload clips you already made, run `python youtube_uploader.py "output/<Video Title>"`.
+- **Upload tab says `youtube_uploader.py` was not found:** Put `youtube_uploader.py` in the same folder as `main.py` and restart the app. To upload clips you already made, use **Load clips from folder…** in the Upload tab or run `python youtube_uploader.py "output/<Video Title>"`.
 - **"quota exceeded" while uploading:** Your daily YouTube API quota is used up. Run the upload again later – clips that already uploaded are skipped.
 - **Upload says the Google login is invalid / expired:** Delete `youtube_token.json` and upload again to sign in once more.
 - **"The Google account ... has no YouTube channel":** Create a channel on youtube.com with that account first.
