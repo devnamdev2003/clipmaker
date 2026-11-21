@@ -1,3 +1,15 @@
+# Viral Clips Studio - install with:  pip install -r requirements.txt
+# (FFmpeg + ffprobe must also be installed and on your PATH - see README.)
+
+customtkinter
 yt-dlp
-google-genai
 python-dotenv
+google-genai
+
+# YouTube auto-upload (youtube_uploader.py)
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+
+# Optional: open the Clip Editor in its own desktop window instead of the browser
+# pywebview

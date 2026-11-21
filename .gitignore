@@ -1,8 +1,9 @@
-node_modules/
-browser-profile/
-browser-profiles/
 .env
-downloads
-output
-client_secret.json
+client_secret*.json
 youtube_token.json
+.venv/
+__pycache__/
+output/
+downloads/
+manual_gemini/
+previews/

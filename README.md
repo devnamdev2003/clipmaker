@@ -17,6 +17,7 @@ Turn any long YouTube video into **5 ready-to-post short clips** for YouTube Sho
   - Choose `9:16`, `16:9`, `1:1`, `4:5`, `Original`, or custom dimensions and drag the crop box directly over the video.
   - Switch to **Split: top + bottom** to stack two different parts of the video (e.g., speaker + screen/reaction) into one vertical clip with independent zoom, framing, and adjustable split height.
 - **Text Overlays (English, Hindi & Emojis):** Add up to 10 styled text layers per clip with custom fonts, outlines, rounded background boxes, timing (`from` / `to` seconds), and drag-and-drop placement on the live output preview.
+- **One-Click YouTube Upload:** When your clips are ready, the app asks *"Upload to YouTube?"*. Review or edit each clip's title and description, choose private / unlisted / public, and upload them all to your channel (with tags, `#Shorts`, and your chosen category). Already-uploaded clips are never uploaded twice. All upload code lives in the separate file `youtube_uploader.py`.
 - **Auto-Generated Post Copy:** Writes YouTube titles, descriptions, hashtags, and Instagram captions for all clips in a single Gemini call, with one-click Copy buttons and automatic saving to `posts.txt`.
 
 ---
@@ -64,8 +65,10 @@ Activate it:
 ### 3. Install Required Python Packages
 
 ```bash
-pip install customtkinter yt-dlp python-dotenv google-genai
+pip install -r requirements.txt
 ```
+
+*(This also installs the Google libraries needed for YouTube upload.)*
 
 ### 4. Optional: Native Editor Window
 
@@ -77,6 +80,8 @@ pip install pywebview
 
 ### 5. Configure Your Settings (`.env`)
 
+Copy `.env.example` to `.env` and fill it in, or use the in-app **Settings** button.
+
 You can configure everything from the **Settings** button inside the app, or create a `.env` file next to `main.py`:
 
 ```env
@@ -85,11 +90,28 @@ GEMINI_MODEL=gemini-3.5-flash-lite
 COOKIES_BROWSER=None
 ```
 
+See `.env.example` for the optional `YOUTUBE_*` upload settings.
+
 > **Tip for age-restricted videos or YouTube "Sign in to confirm you're not a bot" errors:**
 > Set `COOKIES_BROWSER` to the browser where you are logged into YouTube (`chrome`, `edge`, `firefox`, `brave`, `opera`, or `safari`) via the in-app **Settings** menu, or place an exported `cookies.txt` file next to `main.py`.
 
 <!-- Replace with a screenshot of the Settings modal -->
 ![Settings Dialog](./assets/screenshots/2.png)
+
+### 6. Optional: Set Up YouTube Upload (one time)
+
+Skip this if you only want to download the clips.
+
+1. Open [Google Cloud Console](https://console.cloud.google.com/) and create (or pick) a project.
+2. **APIs & Services → Library** → enable **YouTube Data API v3**.
+3. **Google Auth Platform** (or *OAuth consent screen*) → choose **External**, fill in the app name and your email.
+4. **Audience → Test users → Add users** → add the Google account that owns your YouTube channel.
+5. **Clients** (or *Credentials*) → **Create OAuth client ID** → type **Desktop app** → download the JSON.
+6. Save that file next to `main.py` as `client_secret.json`.
+
+The first time you upload, a browser window opens so you can sign in and allow the upload permission. If Google shows *"Google hasn't verified this app"*, click **Advanced → Go to <app name> (unsafe)** – this is normal for your own personal app. The login is then saved in `youtube_token.json`. While the app is in *Testing* mode Google may expire the login after about 7 days; if that happens, delete `youtube_token.json` and sign in again.
+
+> Uploads are **private** by default. Change the visibility in the upload window or with `YOUTUBE_PRIVACY` in `.env`. Check the **Quotas** page in your Cloud Console for your daily upload limit.
 
 ---
 
@@ -152,6 +174,23 @@ Once the 5 clips are ready, the **Clip Editor** opens automatically:
   - **Instagram Caption & Hashtags**
 - Everything is also saved automatically to `posts.txt` and individual `.txt` files alongside each `.mp4` clip.
 
+### Step 5: Upload to YouTube (optional)
+
+- When the clips are finished, a popup asks **"Upload to YouTube?"** Click **Yes**.
+- In the upload window you can:
+  - untick clips you do not want to upload,
+  - edit each clip's **title** and **description**,
+  - choose **private / unlisted / public** and whether to **notify subscribers**.
+- Click **Upload to YouTube**. Each clip shows its progress and, when done, a link to open the video. If a clip fails, fix the problem and press **Retry failed clips**.
+- Titles, descriptions and hashtags come from the post copy written for each clip. Tags are built from the hashtags, and `#Shorts` is added for vertical clips.
+- You can also upload later from a terminal:
+
+```bash
+python youtube_uploader.py "output/<Video Title>"            # every .mp4 in the folder
+python youtube_uploader.py clip1.mp4 --privacy unlisted     # specific files
+python youtube_uploader.py --login                           # only sign in to Google
+```
+
 <!-- Replace with a screenshot of the Titles & Hashtags window -->
 ![Titles and Hashtags](screenshots/titles-hashtags.png)
 
@@ -167,7 +206,10 @@ When you run the app, it automatically creates these folders next to `main.py`:
 | `downloads/` | Downloaded source videos, clip segments, and caption files |
 | `manual_gemini/` | Auto-saved `transcript.txt` and `prompt.txt` for manual Gemini chat fallback |
 | `previews/` | Lightweight 480p H.264 preview copies (created only if requested in the editor) |
-| `.env` | Stores your `GEMINI_API_KEY`, `GEMINI_MODEL`, and `COOKIES_BROWSER` |
+| `.env` | Stores your `GEMINI_API_KEY`, `GEMINI_MODEL`, `COOKIES_BROWSER` and optional `YOUTUBE_*` settings |
+| `client_secret.json` | Your Google OAuth file for YouTube upload (keep private, never share) |
+| `youtube_token.json` | Saved YouTube login, created after the first sign-in (keep private) |
+| `output/<Video Title>/youtube_uploads.json` | Remembers which clips were already uploaded |
 
 ---
 
@@ -177,3 +219,8 @@ When you run the app, it automatically creates these folders next to `main.py`:
 - **YouTube preview stays black in the editor:** Some videos disable embedding or are too long to stream smoothly. Click **Download the video first** inside the editor bar to edit from the local file instead.
 - **Browser cannot play the downloaded video:** Click **Make a smaller preview copy** in the editor bar to generate a browser-compatible H.264 preview (your final clips are still cut from the full-quality download).
 - **Age-restricted or "Not a bot" error:** Open **Settings**, choose the browser where you are signed into YouTube under **Browser cookies**, and close that browser before retrying if Windows locks its cookie database.
+- **"Access blocked: ... has not completed the Google verification process" (Error 403: access_denied):** Add your Google account under **Google Auth Platform → Audience → Test users** in the same Cloud project your `client_secret.json` came from, wait a couple of minutes, and sign in again.
+- **No "Upload to YouTube?" popup:** Make sure `youtube_uploader.py` is in the same folder as `main.py` and restart the app. To upload clips you already made, run `python youtube_uploader.py "output/<Video Title>"`.
+- **"quota exceeded" while uploading:** Your daily YouTube API quota is used up. Run the upload again later – clips that already uploaded are skipped.
+- **Upload says the Google login is invalid / expired:** Delete `youtube_token.json` and upload again to sign in once more.
+- **"The Google account ... has no YouTube channel":** Create a channel on youtube.com with that account first.
