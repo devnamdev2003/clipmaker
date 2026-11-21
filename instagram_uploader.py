@@ -124,7 +124,6 @@ class UploadSettings:
     api_version: str = DEFAULT_API_VERSION
     graph_host: str = DEFAULT_GRAPH_HOST
     share_to_feed: bool = True  # also show the Reel on your profile grid (feed)
-    auto_after_youtube: bool = False  # post automatically when the YouTube upload has finished
 
     @classmethod
     def from_env(cls):
@@ -135,7 +134,6 @@ class UploadSettings:
             graph_host=(os.environ.get("INSTAGRAM_GRAPH_HOST", DEFAULT_GRAPH_HOST).strip()
                         or DEFAULT_GRAPH_HOST).rstrip("/"),
             share_to_feed=_env_bool("INSTAGRAM_SHARE_TO_FEED", True),
-            auto_after_youtube=_env_bool("INSTAGRAM_AUTO_AFTER_YOUTUBE", False),
         )
 
     def configured(self):
@@ -521,8 +519,8 @@ def make_instagram_panel_class():
                              text_color=TEXT, height=36, corner_radius=8, **kw)
 
     class InstagramPanel(ctk.CTkScrollableFrame):
-        """The 'Instagram' tab. Clips are only posted when the user presses the button, or - if they ticked
-        'Post automatically after the YouTube upload' - right after the YouTube upload has finished."""
+        """The 'Instagram' tab. Clips are only posted when the user presses a button here, or uses the
+        'Post to' selector (YouTube / Instagram / Both) in the main window."""
 
         def __init__(self, parent, on_log=None, initial_dir=None):
             super().__init__(parent, fg_color="transparent")
@@ -573,12 +571,7 @@ def make_instagram_panel_class():
             self.feed_check = ctk.CTkCheckBox(
                 opts, text="Also show on my profile grid", variable=self.feed_var, font=font(12), text_color=SOFT,
                 fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=MUTED)
-            self.auto_var = tk.BooleanVar(value=self.settings.auto_after_youtube)
-            self.auto_check = ctk.CTkCheckBox(
-                opts, text="Post automatically after the YouTube upload", variable=self.auto_var, font=font(12),
-                text_color=SOFT, fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=MUTED)
-            self.opt_widgets = [self.feed_check, self.auto_check]
-            attach_flow(opts, lambda: self.opt_widgets, self.opt_widgets, gap=16)
+            self.feed_check.pack(side="left")
 
             self.progress = ctk.CTkProgressBar(self, progress_color=ACCENT, fg_color=RAISED, height=8)
             self.progress.set(0)
@@ -651,7 +644,6 @@ def make_instagram_panel_class():
                 pass
             fresh = UploadSettings.from_env()
             fresh.share_to_feed = bool(self.feed_var.get())
-            fresh.auto_after_youtube = bool(self.auto_var.get())
             self.settings = fresh
 
         def check_setup(self):
@@ -695,8 +687,7 @@ def make_instagram_panel_class():
 
         def _set_editable(self, editable):
             state = "normal" if editable else "disabled"
-            for widget in (self.feed_check, self.auto_check):
-                widget.configure(state=state)
+            self.feed_check.configure(state=state)
             for row in self.rows:
                 if row["item"].media_id:
                     row["check"].configure(state="disabled")
@@ -810,13 +801,6 @@ def make_instagram_panel_class():
                     "Post to Instagram",
                     f"Post {n} Reel{'s' if n != 1 else ''} to Instagram now?\n\nReels are public immediately."):
                 return
-            self.start()
-
-        def start_auto(self):
-            """Called by main.py when the YouTube upload has finished and the auto box is ticked."""
-            if self.running or not self.auto_var.get() or not self.waiting_count():
-                return
-            self.log("YouTube upload finished: starting the Instagram upload automatically.")
             self.start()
 
         def start(self):

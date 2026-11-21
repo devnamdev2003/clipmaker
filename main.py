@@ -3205,7 +3205,7 @@ class ViralClipsApp(ctk.CTk):
         main = ctk.CTkFrame(self, fg_color="transparent")
         main.grid(row=1, column=1, sticky="nsew", padx=(10, 22), pady=(0, 10))
         main.grid_columnconfigure(0, weight=1)
-        main.grid_rowconfigure(1, weight=1)
+        main.grid_rowconfigure(2, weight=1)
 
         step_bar = ctk.CTkFrame(main, fg_color="transparent")
         step_bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
@@ -3218,12 +3218,29 @@ class ViralClipsApp(ctk.CTk):
         self.step_labels[-1].configure(cursor="hand2")  # the Upload step opens the Upload tab
         self.step_labels[-1].bind("<Button-1>", lambda _e: self.tabs.set("Upload"))
 
+        dest_bar = ctk.CTkFrame(main, fg_color="transparent")
+        dest_bar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        ctk.CTkLabel(dest_bar, text="Post clips to:", font=font(13, "bold"), text_color=SOFT).pack(
+            side="left", padx=(4, 8))
+        saved_dest = {"youtube": "YouTube", "instagram": "Instagram", "both": "Both"}.get(
+            os.getenv("POST_DESTINATION", "youtube").strip().lower(), "YouTube")
+        self.dest_var = tk.StringVar(value=saved_dest)
+        self.dest_menu = ctk.CTkSegmentedButton(
+            dest_bar, values=["YouTube", "Instagram", "Both"], variable=self.dest_var,
+            command=self.post_destination_changed, font=font(13, "bold"), fg_color=BG,
+            selected_color=ACCENT, selected_hover_color=ACCENT_HOVER, unselected_color=BG,
+            unselected_hover_color=RAISED, text_color=TEXT)
+        self.dest_menu.pack(side="left")
+        self.upload_now_btn = primary_button(dest_bar, "Upload clips now", self.upload_now, width=160)
+        self.upload_now_btn.configure(height=32)
+        self.upload_now_btn.pack(side="left", padx=(12, 0))
+
         self.tabs = ctk.CTkTabview(
             main, fg_color=PANEL, corner_radius=14, segmented_button_fg_color=BG,
             segmented_button_selected_color=ACCENT, segmented_button_selected_hover_color=ACCENT_HOVER,
             segmented_button_unselected_color=BG, segmented_button_unselected_hover_color=RAISED,
             text_color=TEXT)
-        self.tabs.grid(row=1, column=0, sticky="nsew")
+        self.tabs.grid(row=2, column=0, sticky="nsew")
         for name in ("Clips", "Upload", "Instagram", "Log", "JSON"):
             self.tabs.add(name)
         self.tabs._segmented_button.configure(font=font(13, "bold"), text_color=TEXT)
@@ -3619,12 +3636,51 @@ class ViralClipsApp(ctk.CTk):
                     or (self.instagram_panel and self.instagram_panel.running))
 
     def on_youtube_step(self, state):
-        """Drives the step-6 pill. When the YouTube upload finished completely and 'Post automatically after the
-        YouTube upload' is ticked in the Instagram tab, the Instagram upload starts by itself."""
         self.apply_step(len(STEPS) - 1, state)
-        if (state == "done" and self.instagram_panel and self.upload_panel
-                and not self.upload_panel.cancel.is_set()):
-            self.after(800, self.instagram_panel.start_auto)
+
+    def post_destination_changed(self, value):
+        try:
+            save_env_values({"POST_DESTINATION": {"YouTube": "youtube", "Instagram": "instagram",
+                                                  "Both": "both"}.get(value, "youtube")})
+        except OSError:
+            pass
+
+    def upload_now(self):
+        """Upload the loaded clips to the place chosen in 'Post to': YouTube, Instagram or both."""
+        if self.uploading():
+            messagebox.showinfo("Upload in progress", "An upload is already running. Wait for it to finish or "
+                                                      "cancel it in its tab.")
+            return
+        choice = self.dest_var.get()
+        use_yt, use_ig = choice in ("YouTube", "Both"), choice in ("Instagram", "Both")
+        if use_yt and not self.upload_panel:
+            messagebox.showwarning("YouTube", "youtube_uploader.py was not found next to main.py.")
+            return
+        if use_ig and not self.instagram_panel:
+            messagebox.showwarning("Instagram", "instagram_uploader.py was not found next to main.py.")
+            return
+        if use_ig:
+            count = self.instagram_panel.waiting_count()
+            if not count:
+                self.tabs.set("Instagram")
+                self.instagram_panel.start()  # shows the usual "nothing ticked / no clips" message
+                return
+            if not messagebox.askyesno(
+                    "Post to Instagram",
+                    f"Post {count} Reel{'s' if count != 1 else ''} to Instagram"
+                    f"{' and YouTube' if use_yt else ''} now?\n\nInstagram Reels are public immediately."):
+                return
+        self.log(f"Uploading to: {choice}")
+        if use_yt and use_ig:
+            self.tabs.set("Log")  # both run side by side; the log shows [Upload] and [Instagram] lines
+        elif use_yt:
+            self.tabs.set("Upload")
+        else:
+            self.tabs.set("Instagram")
+        if use_yt:
+            self.upload_panel.start()
+        if use_ig:
+            self.instagram_panel.start()
 
     def reset(self):
         if self.app_state not in ("idle", "finished"):
@@ -3804,9 +3860,9 @@ class ViralClipsApp(ctk.CTk):
                 hint = "\n\nWant them on YouTube? Open the Upload tab (step 6)."
                 if self.instagram_panel:
                     self.instagram_panel.load(result["saved"], source=str(result.get("folder", "")))
-                    self.log("Clips are also listed in the Instagram tab. Nothing is posted until you press Upload "
-                             "(or the YouTube upload finishes, if you ticked the automatic option).")
-                    hint = "\n\nWant them on YouTube / Instagram? Open the Upload or Instagram tab."
+                    self.log("Clips are also listed in the Instagram tab. Nothing is posted until you press "
+                             "'Upload clips now' (choose YouTube, Instagram or Both) or the button in a tab.")
+                    hint = "\n\nWant them online? Choose YouTube / Instagram / Both and press 'Upload clips now'."
             if messagebox.askyesno("Clips ready", result["message"] + hint + "\n\nOpen the output folder now?"):
                 open_path(result["folder"])
             if result.get("open_posts"):

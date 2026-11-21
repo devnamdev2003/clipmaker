@@ -54,7 +54,7 @@ INSTAGRAM_ACCESS_TOKEN=your_long_lived_token
 INSTAGRAM_USER_ID=17841xxxxxxxxxxxxx
 ```
 
-Optional settings are in `.env.example` (`INSTAGRAM_SHARE_TO_FEED`, `INSTAGRAM_AUTO_AFTER_YOUTUBE`).
+Optional settings are in `.env.example` (`INSTAGRAM_SHARE_TO_FEED`, `POST_DESTINATION`).
 
 ## 7. Test it
 
@@ -69,7 +69,7 @@ You should see `Connected as @your_username`.
 ## Using it
 
 - In the app, finished clips are listed in the **Instagram** tab (next to Upload). Check the captions, untick clips you do not want, press **Upload to Instagram**.
-- Tick **Post automatically after the YouTube upload** to have Instagram start by itself as soon as all YouTube uploads finish.
+- Above the tabs, choose **Post clips to: YouTube / Instagram / Both** and press **Upload clips now**. Your choice is remembered. "Both" uploads to YouTube and Instagram at the same time.
 - From a terminal:
 
 ```bash

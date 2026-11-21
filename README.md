@@ -18,7 +18,7 @@ Turn any long YouTube video into **5 ready-to-post short clips** for YouTube Sho
   - Switch to **Split: top + bottom** to stack two different parts of the video (e.g., speaker + screen/reaction) into one vertical clip with independent zoom, framing, and adjustable split height.
 - **Text Overlays (English, Hindi & Emojis):** Add up to 10 styled text layers per clip with custom fonts, outlines, rounded background boxes, timing (`from` / `to` seconds), and drag-and-drop placement on the live output preview.
 - **YouTube Upload tab (step 6):** Nothing is uploaded automatically. When your clips are ready they are listed in the **Upload** tab (also the 6th step above the tabs). Review or edit each clip's title and description, choose private / unlisted / public, then press **Upload to YouTube**. The tab has its own **Upload log** (also mirrored into the Log tab), a setup check, and can load any folder of `.mp4` clips later. Already-uploaded clips are never uploaded twice. All upload code lives in `youtube_uploader.py`.
-- **Instagram Reels upload (new):** The **Instagram** tab posts your clips to Instagram as Reels using the official Instagram Graph API (the file is sent straight from your computer). Captions come from the Gemini post copy, already-posted clips are never posted twice, and an optional switch posts automatically as soon as the YouTube upload has finished. Reels are public immediately. All code lives in `instagram_uploader.py`; setup is in `INSTAGRAM_SETUP.md`.
+- **Instagram Reels upload (new):** The **Instagram** tab posts your clips to Instagram as Reels using the official Instagram Graph API (the file is sent straight from your computer). Captions come from the Gemini post copy, already-posted clips are never posted twice, and a **Post clips to: YouTube / Instagram / Both** selector above the tabs lets you choose where the clips go with one **Upload clips now** button. Reels are public immediately. All code lives in `instagram_uploader.py`; setup is in `INSTAGRAM_SETUP.md`.
 - **Works on small screens:** the left settings panel, the Upload tab and the Clip Editor's video panel all scroll, the step bar and buttons wrap, and dialogs are resizable and never taller than your screen.
 - **Auto-Generated Post Copy:** Writes YouTube titles, descriptions, hashtags, and Instagram captions for all clips in a single Gemini call, with one-click Copy buttons and automatic saving to `posts.txt`.
 
@@ -128,7 +128,7 @@ INSTAGRAM_ACCESS_TOKEN=your_long_lived_token
 INSTAGRAM_USER_ID=17841xxxxxxxxxxxxx
 ```
 
-Then open the **Instagram** tab and press **Test connection** (or run `python instagram_uploader.py --check`). Tick **Post automatically after the YouTube upload** to post to both in one go.
+Then open the **Instagram** tab and press **Test connection** (or run `python instagram_uploader.py --check`). To post to both in one go, choose **Both** in **Post clips to:** above the tabs and press **Upload clips now**.
 
 > Reels cannot be private: they go live on Instagram immediately.
 
