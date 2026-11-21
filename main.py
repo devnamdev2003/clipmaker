@@ -24,6 +24,19 @@ New in this version:
     BOTTOM = gold) appear on the video; drag each one to a different part of the picture (zoom and split height
     are adjustable, a panel can also show the full video). FFmpeg stacks the two parts into one vertical video.
     With the downloaded video you also get a live preview of the finished clip.
+  * ONLY THE CLIPS ARE DOWNLOADED - FOR LONG VIDEOS ONLY (20 minutes or more; LONG_VIDEO_SECONDS; sidebar switch, on
+    by default). Shorter videos open the editor straight from YouTube and are downloaded in full when you press
+    Generate. For long videos, instead of the whole video, only the part of
+    each clip plus 10 seconds before and 10 seconds after it is downloaded (a clip at 21:00-21:20 -> 20:50-21:30,
+    40 seconds). Clips that overlap share one download. The final clip is still exactly the start/end you chose.
+    The parts are downloaded RIGHT AFTER the AI gives the clip times, BEFORE the editor opens. The editor then
+    plays those small files (so you edit inside the tool, not on another site) and you can move the start/end
+    anywhere inside the downloaded 10 s margins. Generate clips just cuts them - nothing more is downloaded.
+    If you used \"Download video first\" (full video), that file is used instead.
+  * TEXT ON THE VIDEO: press "+ Add text" on a clip. Type the text (Hindi works too), pick the font, size, colour,
+    bold/italic, outline, an optional background box (colour, opacity, padding, rounded corners) and place it:
+    drag it on the "Output preview", use the X / Y sliders or the Top / Middle / Bottom buttons. You can also set
+    "from / to" seconds so the text appears only for part of the clip. Add as many texts as you like.
   * "Title & hashtags" button on every clip card: Gemini writes a YouTube title, YouTube description,
     Instagram caption and hashtags from what is said in the clip. Copy buttons for each part.
 
@@ -37,13 +50,16 @@ Also needs FFmpeg + ffprobe on PATH.
     COOKIES_BROWSER=None
 """
 
+import base64
 import json
+import math
 import os
 import queue
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -52,7 +68,7 @@ import importlib.util
 import mimetypes
 import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 import tkinter as tk
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -74,6 +90,7 @@ import yt_dlp
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from yt_dlp.utils import download_range_func
 
 
 # --------------------------------------------------------------------------- #
@@ -93,6 +110,9 @@ CLIP_TOLERANCE = 1.0  # seconds of slack allowed around the chosen duration rang
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 GEMINI_URL = "https://gemini.google.com/app"
 SIZE_DEFAULT = "default"  # clip uses the sidebar "Output shape" setting
+SECTION_PAD = 10  # seconds downloaded before and after every clip when only the clip parts are downloaded
+LONG_VIDEO_SECONDS = 20 * 60  # videos at least this long: only the clips are downloaded; shorter ones play from YouTube
+SECTION_MERGE_GAP = 1  # parts that overlap or are closer than this many seconds are downloaded as one
 
 QUALITY_OPTIONS = {
     "Best available": "bestvideo+bestaudio/best",
@@ -121,7 +141,7 @@ DURATION_OPTIONS = {
 
 COOKIE_BROWSERS = ["None", "chrome", "edge", "firefox", "brave", "opera", "safari"]
 
-DEFAULT_INSTRUCTIONS = "Prioritize funny moments with a strong punchline. Keep the full setup and reaction."
+DEFAULT_INSTRUCTIONS = "Prioritize funny moments with a strong punchline."
 
 STEPS = ["Video info", "Transcript", "AI analysis", "Download", "Create clips"]
 
@@ -221,6 +241,7 @@ class Clip:
     crop_y: float = 0.5  # 0 = top, 0.5 = centre, 1 = bottom
     layout: str = "single"  # "single" = one crop frame, "split" = two frames stacked top / bottom
     split: object = None  # for "split": {"ratio", "top": region, "bottom": region} (see normalize_split)
+    texts: object = None  # text overlays: list of {"png": bytes, "x", "y", "start", "end"} (drawn by the editor)
 
     @property
     def length(self):
@@ -250,6 +271,8 @@ class Job:
     cancel: threading.Event
     download_first: bool = False  # download before editing, edit from the file
     auto_post: bool = True  # write titles/hashtags for all clips after they are created
+    clip_parts_only: bool = True  # download only each clip (+ SECTION_PAD seconds either side), not the whole video
+    video_duration: object = None  # length of the YouTube video in seconds (filled in when the video is read)
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -742,6 +765,61 @@ def locate_download(info, ydl):
     raise FileNotFoundError("Could not find the downloaded video file.")
 
 
+class TerminalLogger:
+    """yt-dlp logger: prints EVERYTHING (including FFmpeg's output) to the terminal window,
+    and passes the important lines on to the app's Log tab."""
+
+    def __init__(self, log=None):
+        self.log = log
+
+    @staticmethod
+    def echo(text):
+        try:
+            print(f"[{time.strftime('%H:%M:%S')}] {text}", flush=True)
+        except Exception:
+            pass
+
+    def debug(self, msg):
+        if msg.startswith("[debug] "):
+            return
+        self.echo(msg)
+
+    def info(self, msg):
+        self.echo(msg)
+
+    def warning(self, msg):
+        self.echo(f"WARNING: {msg}")
+
+    def error(self, msg):
+        self.echo(f"ERROR: {msg}")
+        if self.log:
+            self.log(f"yt-dlp: {msg}", "error")
+
+
+def start_heartbeat(label, status, cancel, folder=None):
+    """Every 3 s: print how long it has been running and how big the files in `folder` are, so you can see
+    that the download is alive even when FFmpeg reports no percentage. Returns a function that stops it."""
+    stop = threading.Event()
+    began = time.time()
+
+    def run():
+        while not stop.wait(3.0) and not cancel.is_set():
+            elapsed = int(time.time() - began)
+            size = 0
+            if folder is not None:
+                try:
+                    size = sum(f.stat().st_size for f in Path(folder).glob("*") if f.is_file()
+                               and f.stat().st_mtime >= began - 1)
+                except OSError:
+                    pass
+            text = f"{label} - running for {elapsed // 60}:{elapsed % 60:02d}" + (f", {size / 1e6:.1f} MB written" if size else "")
+            TerminalLogger.echo(text)
+            status(text)
+
+    threading.Thread(target=run, daemon=True).start()
+    return stop.set
+
+
 def download_video(url, quality, log, status, progress, cancel):
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     top = {"value": 30.0}
@@ -770,6 +848,7 @@ def download_video(url, quality, log, status, progress, cancel):
         "merge_output_format": "mp4",
         "outtmpl": str(DOWNLOAD_DIR / "%(title).150B_%(id)s.%(ext)s"),
         "progress_hooks": [hook],
+        "quiet": False, "no_warnings": False, "logger": TerminalLogger(log),
     })
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -782,6 +861,119 @@ def download_video(url, quality, log, status, progress, cancel):
             raise JobCancelled()
         raise
     return path, info
+
+
+def plan_sections(clips, duration=None, pad=SECTION_PAD):
+    """The time ranges (whole seconds) to download: every clip plus `pad` seconds on both sides.
+    Ranges that overlap or touch are merged, so each clip lies completely inside one range."""
+    spans = []
+    for clip in clips:
+        begin = max(0, int(math.floor(clip.start - pad)))
+        finish = int(math.ceil(clip.end + pad))
+        if duration:
+            finish = min(finish, int(math.ceil(duration)))
+        if finish - begin >= 1:
+            spans.append([begin, finish])
+    spans.sort()
+    merged = []
+    for begin, finish in spans:
+        if merged and begin <= merged[-1][1] + SECTION_MERGE_GAP:
+            merged[-1][1] = max(merged[-1][1], finish)
+        else:
+            merged.append([begin, finish])
+    return [(begin, finish) for begin, finish in merged]
+
+
+def find_part(parts, clip):
+    """The downloaded part that contains this clip (parts: list of {"start", "end", "path"})."""
+    for part in parts:
+        if part["start"] - 0.01 <= clip.start and clip.end <= part["end"] + 0.01:
+            return part
+    for part in parts:  # clip runs a little past the end of the video
+        if part["start"] - 0.01 <= clip.start < part["end"]:
+            return part
+    return None
+
+
+def parts_cover(parts, clip):
+    """True when the clip lies completely inside one of the downloaded parts."""
+    return any(part["start"] - 0.01 <= clip.start and clip.end <= part["end"] + 0.01 for part in parts)
+
+
+def download_clip_parts(url, quality, ranges, log, status, progress, cancel):
+    """Download only the given (start, end) ranges of the video. -> (list of {"start","end","path"}, info)"""
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    total = len(ranges)
+    state = {"files": [], "last": 0.0}
+    if quality == QUALITY_OPTIONS["Best available"]:
+        # Cutting a part means FFmpeg re-encodes it for an exact start. 4K/8K would take very long, and the clips
+        # are made at 1080p-class sizes anyway, so 'Best available' is capped at 1080p for the parts only.
+        quality = QUALITY_OPTIONS["1080p or lower"]
+        TerminalLogger.echo("Clip parts: 'Best available' is limited to 1080p so the cutting stays fast.")
+
+    def hook(data):
+        if cancel.is_set():
+            raise JobCancelled()
+        if data.get("status") == "downloading":
+            done = data.get("downloaded_bytes") or 0
+            number = min(len(state["files"]) + 1, total)
+            status(f"Downloading clip part {number} of {total}…" + (f"  {done / 1e6:.1f} MB" if done else ""))
+            if time.time() - state["last"] >= 2:  # a progress line in the terminal every 2 seconds
+                state["last"] = time.time()
+                speed = (data.get("_speed_str") or "").strip()
+                TerminalLogger.echo(f"part {number}/{total}: {done / 1e6:.1f} MB" + (f"  {speed}" if speed else ""))
+
+    def finished(path):
+        state["files"].append(path)
+        progress(30 + len(state["files"]) / total * 40)
+        status(f"Downloaded clip part {len(state['files'])} of {total}")
+        TerminalLogger.echo(f"Finished part {len(state['files'])}/{total}: {Path(path).name}")
+        log(f"  part {len(state['files'])} of {total} ready", "ok")
+
+    options = ydl_base_options()
+    options.update({
+        "format": quality,
+        "merge_output_format": "mp4",
+        "outtmpl": str(DOWNLOAD_DIR / "part_%(id)s_%(section_start)d_%(section_end)d.%(ext)s"),
+        "download_ranges": download_range_func(None, [(float(a), float(b)) for a, b in ranges]),
+        "force_keyframes_at_cuts": True,  # exact start, not the nearest earlier keyframe
+        "overwrites": True,
+        "progress_hooks": [hook],
+        "post_hooks": [finished],
+        "quiet": False, "no_warnings": False, "logger": TerminalLogger(log),
+    })
+    TerminalLogger.echo(f"Downloading {total} clip part(s): " + ", ".join(
+        f"{format_timestamp(a)}-{format_timestamp(b)}" for a, b in ranges))
+    stop_heartbeat = start_heartbeat("Cutting the clip parts (FFmpeg)", status, cancel, DOWNLOAD_DIR)
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except JobCancelled:
+        raise
+    except Exception:
+        if cancel.is_set():
+            raise JobCancelled()
+        raise
+    finally:
+        stop_heartbeat()
+
+    video_exts = {".mp4", ".mkv", ".webm", ".mov"}
+    parts = []
+    for number, (begin, finish) in enumerate(ranges):
+        path = None
+        if len(state["files"]) == total:  # yt-dlp downloads the ranges in the order they were given
+            candidate = Path(state["files"][number])
+            if candidate.is_file():
+                path = candidate
+        if path is None:
+            found = [f for f in DOWNLOAD_DIR.glob(f"part_*_{begin}_{finish}.*")
+                     if f.suffix.lower() in video_exts and not f.name.endswith((".part", ".ytdl"))]
+            if found:
+                path = max(found, key=lambda f: f.stat().st_mtime)
+        if path is None:
+            raise FileNotFoundError(f"Could not find the downloaded part {format_timestamp(begin)} to {format_timestamp(finish)}.")
+        parts.append({"start": float(begin), "end": float(finish), "path": path})
+    return parts, info
 
 
 def pick_caption_languages(info):
@@ -949,25 +1141,87 @@ def make_split_filter_complex(output_size, split):
     return f"[0:v]split=2[s0][s1];[s0]{top}[t];[s1]{bottom}[b];[t][b]vstack=inputs=2[v]"
 
 
-def cut_clip(source_path, output_path, start, end, output_size, cancel, crop_x=0.5, crop_y=0.5, split=None):
-    command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-ss", f"{start:.3f}", "-i", str(source_path),
-        "-t", f"{end - start:.3f}",
-    ]
-    if split and output_size:
-        command.extend(["-filter_complex", make_split_filter_complex(output_size, split),
-                        "-map", "[v]", "-map", "0:a:0?"])
-    else:
-        command.extend(["-map", "0:v:0", "-map", "0:a:0?"])
-        video_filter = make_video_filter(output_size, crop_x, crop_y)
-        if video_filter:
-            command.extend(["-vf", video_filter])
-    command.extend([
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output_path),
-    ])
-    code, _, err = run_process(command, cancel=cancel, timeout=1800)
+PNG_DATA_PREFIX = "data:image/png;base64,"
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+MAX_TEXTS_PER_CLIP = 10
+
+
+def decode_png_data_url(value):
+    """The editor draws every text into a transparent PNG (so fonts, Hindi, outline and box look exactly as in the editor)."""
+    if not isinstance(value, str) or not value.startswith(PNG_DATA_PREFIX):
+        return None
+    try:
+        raw = base64.b64decode(value[len(PNG_DATA_PREFIX):], validate=True)
+    except ValueError:
+        return None
+    if len(raw) > 8_000_000 or not raw.startswith(PNG_SIGNATURE):
+        return None
+    return raw
+
+
+def optional_seconds(value):
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number >= 0 else None
+
+
+def overlay_expression(item):
+    """FFmpeg overlay filter: puts the text picture where the user placed it (kept inside the frame)."""
+    x, y = clamp01(item.get("x"), 0.5), clamp01(item.get("y"), 0.85)
+    text = (f"overlay=x='max(0,min(main_w-overlay_w,main_w*{x:.4f}-overlay_w/2))':"
+            f"y='max(0,min(main_h-overlay_h,main_h*{y:.4f}-overlay_h/2))'")
+    start, end = item.get("start"), item.get("end")
+    if start is not None and end is not None:
+        text += f":enable='between(t,{start:.2f},{end:.2f})'"
+    elif start is not None:
+        text += f":enable='gte(t,{start:.2f})'"
+    elif end is not None:
+        text += f":enable='lte(t,{end:.2f})'"
+    return text
+
+
+def cut_clip(source_path, output_path, start, end, output_size, cancel, crop_x=0.5, crop_y=0.5, split=None, texts=None):
+    texts = list(texts or [])
+    if texts and not output_size:
+        output_size = VERTICAL_DEFAULT
+    with tempfile.TemporaryDirectory(prefix="viral_clips_text_") as tmp:
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-ss", f"{start:.3f}", "-i", str(source_path),
+        ]
+        for number, item in enumerate(texts):
+            picture = Path(tmp) / f"text{number}.png"
+            picture.write_bytes(item["png"])
+            command.extend(["-i", str(picture)])
+        command.extend(["-t", f"{end - start:.3f}"])
+        if texts:
+            if split and output_size:
+                graph = make_split_filter_complex(output_size, split)
+            else:
+                graph = f"[0:v]{make_video_filter(output_size, crop_x, crop_y)}[v]"
+            last = "v"
+            for number, item in enumerate(texts):
+                label = f"o{number}"
+                graph += f";[{last}][{number + 1}:v]{overlay_expression(item)}[{label}]"
+                last = label
+            command.extend(["-filter_complex", graph, "-map", f"[{last}]", "-map", "0:a:0?"])
+        elif split and output_size:
+            command.extend(["-filter_complex", make_split_filter_complex(output_size, split),
+                            "-map", "[v]", "-map", "0:a:0?"])
+        else:
+            command.extend(["-map", "0:v:0", "-map", "0:a:0?"])
+            video_filter = make_video_filter(output_size, crop_x, crop_y)
+            if video_filter:
+                command.extend(["-vf", video_filter])
+        command.extend([
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output_path),
+        ])
+        code, _, err = run_process(command, cancel=cancel, timeout=1800)
     if code != 0:
         lines = (err or "").strip().splitlines()
         raise RuntimeError(lines[-1] if lines else "FFmpeg failed")
@@ -1300,6 +1554,8 @@ def clip_summary(clip):
     text = f"{format_timestamp(clip.start)} to {format_timestamp(clip.end)}, {clip.length:.0f} seconds"
     if clip.size != SIZE_DEFAULT:
         text += f", {clip.size[0]}×{clip.size[1]}" if clip.size else ", original size"
+        if clip.texts:
+            text += f", {len(clip.texts)} text" + ("s" if len(clip.texts) > 1 else "")
         if clip.layout == "split":
             text += ", split screen (top + bottom)"
         elif clip.size and (abs(clip.crop_x - 0.5) > 0.005 or abs(clip.crop_y - 0.5) > 0.005):
@@ -1310,7 +1566,7 @@ def clip_summary(clip):
 def clip_output_size(clip, default_size):
     """Per-clip size from the editor, otherwise the 'Output shape' chosen in the sidebar."""
     size = default_size if clip.size == SIZE_DEFAULT else clip.size
-    if clip.layout == "split" and not size:  # a split screen needs a real output size
+    if (clip.layout == "split" or clip.texts) and not size:  # split screen and text need a real output size
         size = VERTICAL_DEFAULT
     return size
 
@@ -1318,7 +1574,7 @@ def clip_output_size(clip, default_size):
 class EditorSession:
     """Everything the editor page needs to know about the current video."""
 
-    def __init__(self, video_id, title, duration, embeddable, clips, default_size, video_path=None):
+    def __init__(self, video_id, title, duration, embeddable, clips, default_size, video_path=None, parts=None):
         self.video_id = video_id
         self.title = title
         self.duration = duration
@@ -1327,18 +1583,28 @@ class EditorSession:
         self.default_size = default_size
         self.video_path = video_path  # the downloaded video (None until it is downloaded)
         self.preview_path = None  # small copy that every browser can play (only if needed)
-        self.version = 1 if video_path else 0  # changes whenever the file to play changes
+        self.parts = list(parts or [])  # downloaded clip parts: {"start", "end", "path"[, "preview"]}
+        self.version = 1 if (video_path or self.parts) else 0  # changes whenever the file to play changes
         self.task = {"name": "", "percent": 0, "message": "", "error": ""}
+        self.clip_jobs = {}  # "download this clip" jobs: id -> {status, percent, message, error, path, name}
 
     @property
     def play_path(self):
         return self.preview_path or self.video_path
 
+    def part_path(self, index):
+        """The file to play for downloaded part number `index` (the small preview copy if there is one)."""
+        try:
+            part = self.parts[int(index)]
+        except (IndexError, TypeError, ValueError):
+            return None
+        return part.get("preview") or part["path"]
+
     def set_task(self, **values):
         self.task.update(values)
 
     def state(self):
-        return {"task": dict(self.task), "local": bool(self.play_path), "version": self.version}
+        return {"task": dict(self.task), "local": bool(self.parts or self.play_path), "version": self.version}
 
     def data(self):
         items = []
@@ -1354,7 +1620,8 @@ class EditorSession:
         return {
             "video_id": self.video_id, "title": self.title, "duration": self.duration,
             "embeddable": self.embeddable, "clips": items,
-            "local": bool(self.play_path), "version": self.version,
+            "parts": [{"start": part["start"], "end": part["end"]} for part in self.parts],
+            "local": bool(self.parts or self.play_path), "version": self.version,
         }
 
 
@@ -1384,11 +1651,24 @@ background:rgba(0,0,0,.6);padding:2px 9px;border-radius:10px;white-space:nowrap;
 #cropB{border-color:var(--warn)}
 .player-box.split .crop{box-shadow:none;background:rgba(139,155,255,.16)}
 .player-box.split #cropB{background:rgba(232,176,74,.18)}
-#pvwrap{margin-top:12px}
-#pvc{display:block;height:260px;width:auto;max-width:100%;border:1px solid var(--line);border-radius:8px;background:#000;margin-top:4px}
+#pvwrap{flex:none;width:172px}
+.stagetop{display:flex;gap:12px;align-items:flex-start}
+.stagetop .player-box{flex:1;min-width:0}
+#pvc{display:block;height:300px;width:auto;max-width:172px;border:1px solid var(--line);border-radius:8px;background:#000;margin-top:4px}
 .splitctl{margin-top:4px;padding:6px 8px;border:1px dashed var(--line);border-radius:8px}
 .splitctl input[type=range]{width:110px;accent-color:var(--accent);padding:0}
 .splitctl .mode{max-width:140px}
+.textctl{margin-top:6px;padding:8px;border:1px dashed var(--line);border-radius:8px}
+.textctl textarea{width:100%;background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:6px 8px;font:inherit;resize:vertical}
+.textctl textarea:focus{outline:none;border-color:var(--accent)}
+.textctl input[type=color]{width:34px;height:28px;padding:0;border:1px solid var(--line);border-radius:6px;background:none;cursor:pointer}
+.textctl input[type=range]{width:90px;accent-color:var(--accent);padding:0}
+.textctl .fontin{width:150px}
+.chk{display:inline-flex;gap:4px;align-items:center;cursor:pointer;color:var(--soft);font-size:13px}
+.chip.on{border-color:var(--accent);color:var(--accent)}
+.danger{color:var(--bad)}
+#pvc{touch-action:none}
+#pvc.hasText{cursor:grab}
 .stage{max-height:calc(100vh - 135px);overflow-y:auto;padding-bottom:8px}
 .scrubrow{display:flex;gap:10px;align-items:center;margin-top:10px}
 .scrubrow input[type=range]{flex:1;accent-color:var(--accent);padding:0}
@@ -1415,7 +1695,7 @@ input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent)}
 .bar{height:6px;background:var(--raised);border-radius:3px;margin:10px 0 8px;position:relative;overflow:hidden}
 .bar i{position:absolute;top:0;bottom:0;background:var(--accent);border-radius:3px}
 .row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px}
-.row .lab{width:42px;color:var(--soft);font-size:12px}
+.row .lab{width:54px;color:var(--soft);font-size:12px}
 button{font:inherit;cursor:pointer;border:1px solid var(--line);background:var(--raised);color:var(--text);border-radius:7px;padding:5px 9px}
 button:hover{background:var(--line)}
 .mini{padding:3px 7px;font-size:12px}
@@ -1433,11 +1713,12 @@ padding:12px 24px;display:flex;align-items:center;gap:16px;justify-content:space
 </style></head>
 <body>
 <header><h1 id="vtitle">Clip editor</h1>
-<div class="sub">Watch the video straight from YouTube, set each clip's time and size, then press Generate. Nothing is downloaded until you do.</div></header>
+<div class="sub">Watch the video straight from YouTube, set each clip's time and size, then press Generate. The video is downloaded when you press Generate.</div></header>
 <main>
  <section class="stage">
-  <div class="player-box"><div id="player"></div><div id="crop" class="crop" data-k="single" data-label="✥ drag to move"></div>
+  <div class="stagetop"><div class="player-box"><div id="player"></div><div id="crop" class="crop" data-k="single" data-label="✥ drag to move"></div>
    <div id="cropT" class="crop" data-k="top" data-label="TOP ✥"></div><div id="cropB" class="crop" data-k="bottom" data-label="BOTTOM ✥"></div></div>
+   <div id="pvwrap" style="display:none"><div class="sub">Output <span id="pvsize"></span></div><canvas id="pvc"></canvas><div class="sub" id="pvnote"></div></div></div>
   <div class="banner" id="banner"></div>
   <div class="localbar" id="localbar">
    <span id="lbtext">Long video that will not play here, or want smoother editing?</span>
@@ -1450,9 +1731,10 @@ padding:12px 24px;display:flex;align-items:center;gap:16px;justify-content:space
    <span>Now: <b id="now">00:00.0</b> / <span id="total">--:--</span></span>
    <label><input type="checkbox" id="showcrop" checked> Show the crop frame of the selected clip</label>
   </div>
-  <div id="pvwrap" style="display:none"><div class="sub">Output preview <span id="pvsize"></span></div><canvas id="pvc"></canvas><div class="sub" id="pvnote"></div></div>
+  <datalist id="fontlist"></datalist>
   <div class="hint">Pause on the exact frame, then press <b>Set = now</b> on a clip. Click a clip to select it and see its crop frame.
   <b>Drag the bright frame on the video to move it</b> and choose which part is kept (use the Center button to reset).
+  <b>Text:</b> press “＋ Add text” on a clip, then choose font, colours and background; drag the text on the Output preview (right of the video) to place it.
   <b>Split screen:</b> set Layout to “Split: top + bottom” on a clip to show two different parts of the video in one vertical clip - drag the blue TOP box and the gold BOTTOM box.
   Width and height must be even numbers; the video is scaled to fill the frame and the part inside your frame is cut out.</div>
  </section>
@@ -1463,17 +1745,23 @@ padding:12px 24px;display:flex;align-items:center;gap:16px;justify-content:space
  <button class="primary" id="gen">Generate clips</button>
 </footer>
 <div id="done"><div><h2>Sent to the app</h2>
-<div class="sub" style="font-size:14px">The video is downloading and your clips are being created.<br>Go back to Viral Clips Studio to watch the progress. You can close this window.</div></div></div>
+<div class="sub" style="font-size:14px">Your clips are being created.<br>Go back to Viral Clips Studio to watch the progress. You can close this window.</div></div></div>
 <script type="application/json" id="data">__DATA__</script>
 <script>
 const D=JSON.parse(document.getElementById('data').textContent);
 const $=s=>document.querySelector(s);
 const defReg=k=>({x:k==='top'?0:1,y:.5,z:1,fit:false});
 const clips=D.clips.map(c=>{const s=c.split||{};
- return {...c,enabled:true,cx:c.crop_x==null?.5:c.crop_x,cy:c.crop_y==null?.5:c.crop_y,layout:c.layout==='split'?'split':'single',
+ return {...c,enabled:true,cx:c.crop_x==null?.5:c.crop_x,cy:c.crop_y==null?.5:c.crop_y,layout:c.layout==='split'?'split':'single',texts:[],ti:0,
   ratio:s.ratio==null?.5:s.ratio,top:{...defReg('top'),...(s.top||{})},bottom:{...defReg('bottom'),...(s.bottom||{})}}});
 let active=0,player=null,ready=false,stopAt=null,duration=D.duration||0;
 let ytPlayer=null,local=false,localVersion=0,SA=16/9;
+const PARTS=D.parts||[];
+if(PARTS.length)document.querySelector('header .sub').textContent="Set each clip's time and size, then press Generate. Only each clip (plus 10 s before and after) was downloaded, not the whole video.";let curPart=-1,pendingSeek=null,wantPlay=false;
+function partFor(t){let best=0,bd=1e9;for(let i=0;i<PARTS.length;i++){const p=PARTS[i];
+ if(t>=p.start-0.01&&t<=p.end+0.01)return i;const d=Math.min(Math.abs(t-p.start),Math.abs(t-p.end));if(d<bd){bd=d;best=i}}return best}
+function inParts(a,b){return PARTS.some(p=>a>=p.start-0.01&&b<=p.end+0.01)}
+function scrubSpan(){if(PARTS.length&&curPart>=0){const p=PARTS[curPart];return[p.start,p.end-p.start]}return[0,duration]}
 const PRESETS=[["Original size",null,null],["Vertical 9:16 (1080×1920)",1080,1920],["Horizontal 16:9 (1920×1080)",1920,1080],
 ["Square 1:1 (1080×1080)",1080,1080],["Portrait 4:5 (1080×1350)",1080,1350],["Custom size",0,0]];
 
@@ -1491,7 +1779,7 @@ function cardHTML(c,i){
  return `<div class="card" data-i="${i}">
  <div class="chead"><input type="checkbox" class="en" checked title="Include this clip">
   <span class="rank">#${c.rank}</span><input class="title" value="${esc(c.title)}">
-  <button data-act="play">▶ Preview</button></div>
+  <button data-act="play">▶ Preview</button> <button data-act="dlclip" title="Cut this clip with all your edits and save it now">⬇ Download this clip</button></div>
  <div class="bar"><i></i></div>
  <div class="row"><span class="lab">Start</span><input class="t" data-f="start"> <button class="mini" data-act="now" data-w="start">Set = now</button>${nudge('s')}</div>
  <div class="row"><span class="lab">End</span><input class="t" data-f="end"> <button class="mini" data-act="now" data-w="end">Set = now</button>${nudge('e')}</div>
@@ -1510,14 +1798,20 @@ function cardHTML(c,i){
    <span class="sub">height of the top part</span></div>
   <div class="sub">Drag the blue TOP box and the gold BOTTOM box on the video to choose what each part shows.</div>
  </div>
+ <div class="row"><span class="lab">Text</span><button class="mini" data-act="addtext">＋ Add text</button><span class="tchips"></span></div>
+ <div class="tpanel"></div>
  <div class="len"></div><div class="err"></div></div>`}
 
 function validate(c){
  if(!(c.end>c.start+0.5))return'the end must be after the start';
  if(duration&&c.start>=duration)return'the start is after the end of the video';
+  if(PARTS.length&&!inParts(c.start,c.end)){const p=PARTS[partFor((c.start+c.end)/2)];
+   return'the clip must stay inside the downloaded part ('+fmt(p.start)+' to '+fmt(p.end)+')'}
  if(!!c.width!==!!c.height)return'set both width and height (or neither)';
  if(c.width&&(c.width<100||c.width>4096||c.height<100||c.height>4096))return'width and height must be between 100 and 4096';
  if(c.layout==='split'&&!c.width)return'a split screen needs a size (pick Vertical 9:16)';
+ if(c.texts.length&&!c.width)return'text needs a size (pick Vertical 9:16)';
+ for(const t of c.texts){if((t.start!=null&&t.end!=null)&&t.end<=t.start)return'a text must end after it starts'}
  return''}
 
 function sync(i){
@@ -1562,6 +1856,84 @@ function overlay(){
   Object.assign(el.style,{display:'block',width:b.w*100+'%',height:b.h*100+'%',left:(1-b.w)*p.x*100+'%',top:(1-b.h)*p.y*100+'%'})}
  drawPreview()}
 
+// ---- text on the video -------------------------------------------------
+function fontOk(n){const g=document.createElement('canvas').getContext('2d'),s='mmmmmmmmmmlliWWWअआक';
+ return ['monospace','serif','sans-serif'].some(b=>{g.font='72px '+b;const w0=g.measureText(s).width;g.font='72px "'+n+'",'+b;return g.measureText(s).width!==w0})}
+const FONTS=['Arial','Arial Black','Segoe UI','Segoe UI Black','Bahnschrift','Impact','Verdana','Tahoma','Trebuchet MS','Georgia','Times New Roman',
+ 'Courier New','Comic Sans MS','Calibri','Cambria','Consolas','Franklin Gothic Medium','Nirmala UI','Mangal','Kokila','Helvetica','Helvetica Neue','Roboto','Open Sans','Montserrat','Poppins'].filter(fontOk).concat(['sans-serif','serif']);
+$('#fontlist').innerHTML=FONTS.map(f=>`<option value="${esc(f)}">`).join('');
+const TEXT_POS=[['Top',.12],['Middle',.5],['Bottom',.85]];
+function newText(n){return{text:'Your text',font:FONTS.includes('Arial')?'Arial':FONTS[0],size:72,bold:true,italic:false,color:'#ffffff',align:'center',
+ strokeW:0,strokeColor:'#000000',bg:true,bgColor:'#000000',bgOpacity:.6,pad:18,radius:14,x:.5,y:[.85,.15,.5][n%3],start:null,end:null}}
+function roundRectPath(g,x,y,w,h,r){r=Math.max(0,Math.min(r,w/2,h/2));g.beginPath();g.moveTo(x+r,y);g.arcTo(x+w,y,x+w,y+h,r);g.arcTo(x+w,y+h,x,y+h,r);g.arcTo(x,y+h,x,y,r);g.arcTo(x,y,x+w,y,r);g.closePath()}
+function hexRGBA(h,a){const n=parseInt(h.slice(1),16)||0;return`rgba(${n>>16&255},${n>>8&255},${n&255},${a})`}
+const tcache=new Map();
+function renderText(t,outW){
+ const key=JSON.stringify([t.text,t.font,t.size,t.bold,t.italic,t.color,t.align,t.strokeW,t.strokeColor,t.bg,t.bgColor,t.bgOpacity,t.pad,t.radius,outW]);
+ if(tcache.has(key))return tcache.get(key);
+ const size=Math.max(8,Math.min(600,+t.size||72)),sw=Math.max(0,+t.strokeW||0),p=t.bg?Math.max(0,+t.pad||0):0;
+ const font=`${t.italic?'italic ':''}${t.bold?'700':'400'} ${size}px "${t.font}", sans-serif`;
+ const m=document.createElement('canvas').getContext('2d');m.font=font;
+ const maxW=Math.max(60,outW*.94-2*p-2*sw),lines=[];
+ String(t.text).split('\n').forEach(par=>{let cur='';par.split(' ').forEach(w=>{const test=cur?cur+' '+w:w;
+  if(cur&&m.measureText(test).width>maxW){lines.push(cur);cur=w}else cur=test});lines.push(cur)});
+ const lh=Math.round(size*1.25),tw=Math.ceil(Math.max(1,...lines.map(l=>m.measureText(l).width)));
+ const W=tw+2*p+2*sw+2,H=lines.length*lh+2*p+2*sw,cv=document.createElement('canvas');cv.width=W;cv.height=H;
+ const g=cv.getContext('2d');g.font=font;g.textBaseline='middle';g.lineJoin='round';
+ if(t.bg){roundRectPath(g,sw,sw,W-2*sw,H-2*sw,+t.radius||0);g.fillStyle=hexRGBA(t.bgColor,Math.min(1,Math.max(0,t.bgOpacity)));g.fill()}
+ g.textAlign=t.align;const tx=t.align==='left'?sw+p+1:t.align==='right'?W-sw-p-1:W/2;
+ lines.forEach((l,n)=>{const y=sw+p+n*lh+lh/2;
+  if(sw>0){g.lineWidth=sw*2;g.strokeStyle=t.strokeColor;g.strokeText(l,tx,y)}
+  g.fillStyle=t.color;g.fillText(l,tx,y)});
+ if(tcache.size>60)tcache.clear();tcache.set(key,cv);return cv}
+function textRect(c,t){const cv=renderText(t,c.width),w=cv.width,h=cv.height;
+ return{cv,w,h,left:Math.min(Math.max(0,t.x*c.width-w/2),Math.max(0,c.width-w)),top:Math.min(Math.max(0,t.y*c.height-h/2),Math.max(0,c.height-h))}}
+function exportTexts(c){return c.texts.filter(t=>String(t.text).trim()).map(t=>({png:renderText(t,c.width).toDataURL('image/png'),x:t.x,y:t.y,start:t.start,end:t.end}))}
+function chipsHTML(c){return c.texts.map((t,n)=>`<button class="mini chip${n===c.ti?' on':''}" data-act="seltext" data-n="${n}">${esc(String(t.text).trim().slice(0,10)||'Text '+(n+1))}</button>`).join('')}
+function textPanel(c){const t=c.texts[c.ti];if(!t)return'';
+ const num=(f,min,max,step)=>`<input class="n" type="number" data-tf="${f}" min="${min}" max="${max}" step="${step}" value="${t[f]}">`;
+ const chk=(f,l)=>`<label class="chk"><input type="checkbox" data-tf="${f}"${t[f]?' checked':''}> ${l}</label>`;
+ const opt=(v,l)=>`<option value="${v}"${t.align===v?' selected':''}>${l}</option>`;
+ return`<div class="textctl">
+ <textarea data-tf="text" rows="2" placeholder="Type your text here (Hindi and emoji work too)">${esc(t.text)}</textarea>
+ <div class="row"><span class="lab">Font</span><input class="fontin" list="fontlist" data-tf="font" value="${esc(t.font)}" title="Pick from the list or type any font installed on this computer"> Size ${num('size',8,600,2)} ${chk('bold','Bold')} ${chk('italic','Italic')}</div>
+ <div class="row"><span class="lab">Color</span><input type="color" data-tf="color" value="${t.color}"> Align <select data-tf="align">${opt('left','Left')}${opt('center','Center')}${opt('right','Right')}</select>
+  Outline ${num('strokeW',0,30,1)} <input type="color" data-tf="strokeColor" value="${t.strokeColor}"></div>
+ <div class="row"><span class="lab">Back</span>${chk('bg','Background box')} <input type="color" data-tf="bgColor" value="${t.bgColor}">
+  Opacity <input type="range" data-tf="bgOpacity" data-div="100" min="0" max="100" value="${Math.round(t.bgOpacity*100)}"></div>
+ <div class="row"><span class="lab"></span>Padding ${num('pad',0,200,2)} Round ${num('radius',0,200,2)}</div>
+ <div class="row"><span class="lab">Position</span>X <input class="tx" type="range" data-tf="x" data-div="100" min="0" max="100" value="${Math.round(t.x*100)}">
+  Y <input class="ty" type="range" data-tf="y" data-div="100" min="0" max="100" value="${Math.round(t.y*100)}">
+  ${TEXT_POS.map(p=>`<button class="mini" data-act="tpos" data-y="${p[1]}">${p[0]}</button>`).join('')}</div>
+ <div class="row"><span class="lab">Show</span>from <input class="n" type="number" data-tf="start" min="0" step="0.1" placeholder="0" value="${t.start==null?'':t.start}">
+  to <input class="n" type="number" data-tf="end" min="0" step="0.1" placeholder="end" value="${t.end==null?'':t.end}"> sec
+  <button class="mini danger" data-act="deltext">Delete this text</button></div>
+ <div class="sub">Drag the text on the “Output preview” to move it. Leave “from / to” empty to show it for the whole clip.</div></div>`}
+function refreshText(i){const c=clips[i],el=$(`.card[data-i="${i}"]`);if(!el)return;
+ el.querySelector('.tchips').innerHTML=chipsHTML(c);el.querySelector('.tpanel').innerHTML=textPanel(c)}
+function syncTextPos(i){const c=clips[i],t=c.texts[c.ti],el=$(`.card[data-i="${i}"]`);if(!t||!el)return;
+ const a=el.querySelector('.tx'),b=el.querySelector('.ty');if(a)a.value=Math.round(t.x*100);if(b)b.value=Math.round(t.y*100)}
+function textInput(c,i,t){const tx=c.texts[c.ti];if(!tx)return;const f=t.dataset.tf;let v;
+ if(t.type==='checkbox')v=t.checked;
+ else if(t.type==='number'||t.type==='range'){
+  if(t.value===''){if(f==='start'||f==='end')v=null;else return}
+  else{v=parseFloat(t.value);if(isNaN(v))return;if(t.dataset.div)v/=+t.dataset.div}}
+ else v=t.value;
+ tx[f]=v;
+ if(f==='text'){const ch=$(`.card[data-i="${i}"] .tchips`);if(ch)ch.innerHTML=chipsHTML(c)}
+ sync(i)}
+(function(){const cv=$('#pvc');let drag=null;
+ const pt=e=>{const r=cv.getBoundingClientRect();return{x:(e.clientX-r.left)*cv.width/r.width,y:(e.clientY-r.top)*cv.height/r.height}};
+ cv.addEventListener('pointerdown',e=>{const c=clips[active];if(!c||!c.texts.length||!c._rects)return;const q=pt(e);
+  for(let n=c.texts.length-1;n>=0;n--){const r=c._rects[n];
+   if(r&&q.x>=r.x&&q.x<=r.x+r.w&&q.y>=r.y&&q.y<=r.y+r.h){
+    drag={n,dx:q.x-(r.x+r.w/2),dy:q.y-(r.y+r.h/2),k:cv.height/c.height};
+    if(c.ti!==n){c.ti=n;refreshText(active)}
+    cv.setPointerCapture(e.pointerId);e.preventDefault();return}}});
+ cv.addEventListener('pointermove',e=>{if(!drag)return;const c=clips[active],t=c.texts[drag.n],q=pt(e);
+  t.x=clamp01((q.x-drag.dx)/(c.width*drag.k));t.y=clamp01((q.y-drag.dy)/(c.height*drag.k));syncTextPos(active);drawPreview()});
+ const end=()=>{drag=null};cv.addEventListener('pointerup',end);cv.addEventListener('pointercancel',end)})();
+
 function panelsOf(c){
  if(c.layout==='split'){const [th,bh]=panelHeights(c);return[{k:'top',y:0,h:th,r:c.top},{k:'bottom',y:th,h:bh,r:c.bottom}]}
  return[{k:'single',y:0,h:c.height,r:{x:c.cx,y:c.cy,z:1,fit:false}}]}
@@ -1569,7 +1941,7 @@ function drawPreview(){
  const wrap=$('#pvwrap'),c=clips[active];
  if(!c||!c.width||!c.height){wrap.style.display='none';return}
  wrap.style.display='';
- const cv=$('#pvc'),H=260,W=Math.max(40,Math.round(H*c.width/c.height));
+ const cv=$('#pvc'),H=300,W=Math.max(40,Math.round(H*c.width/c.height));
  if(cv.width!==W||cv.height!==H){cv.width=W;cv.height=H}
  const ctx=cv.getContext('2d'),k=H/c.height,v=local?document.querySelector('#player video'):null;
  const ok=!!(v&&v.videoWidth&&v.readyState>=2);
@@ -1582,17 +1954,23 @@ function drawPreview(){
    ctx.fillStyle='#c3c7d1';ctx.font='13px sans-serif';ctx.textAlign='center';
    ctx.fillText(p.k==='single'?'clip':p.k.toUpperCase(),W/2,py+ph/2)}});
  if(c.layout==='split'){const y=panelHeights(c)[0]*k;ctx.fillStyle='#8b9bff';ctx.fillRect(0,y-1,W,2)}
+ ctx.imageSmoothingQuality='high';c._rects=[];
+ c.texts.forEach((t,n)=>{if(!String(t.text).trim()){c._rects[n]=null;return}
+  const r=textRect(c,t);ctx.drawImage(r.cv,r.left*k,r.top*k,r.w*k,r.h*k);c._rects[n]={x:r.left*k,y:r.top*k,w:r.w*k,h:r.h*k};
+  if(n===c.ti){ctx.save();ctx.strokeStyle='#8b9bff';ctx.setLineDash([4,3]);ctx.lineWidth=1;ctx.strokeRect(r.left*k-1.5,r.top*k-1.5,r.w*k+3,r.h*k+3);ctx.restore()}});
+ cv.classList.toggle('hasText',c.texts.length>0);
  $('#pvsize').textContent=`(${c.width}×${c.height})`;
- $('#pvnote').textContent=ok?'':'Live picture needs the downloaded video - press “Download the video first”.'}
+ $('#pvnote').textContent=ok?'':'Live picture: press “Download the video first”.'}
 setInterval(drawPreview,70);
 const clamp01=v=>Math.min(1,Math.max(0,v));
 
 function select(i){active=i;document.querySelectorAll('.card').forEach(n=>n.classList.toggle('active',+n.dataset.i===i));overlay()}
 function seek(t){if(ready){player.seekTo(Math.max(0,t),true);player.pauseVideo();stopAt=null}}
-function setTime(i,w,v){const c=clips[i];if(isNaN(v))return;v=Math.max(0,duration?Math.min(v,duration):v);c[w]=Math.round(v*10)/10;sync(i);seek(w==='start'?c.start:c.end-0.3)}
+function setTime(i,w,v){const c=clips[i];if(isNaN(v))return;v=Math.max(0,duration?Math.min(v,duration):v);
+ if(PARTS.length){const p=PARTS[partFor((c.start+c.end)/2)];v=Math.max(p.start,Math.min(v,p.end))}c[w]=Math.round(v*10)/10;sync(i);seek(w==='start'?c.start:c.end-0.3)}
 
 $('#list').innerHTML=clips.map(cardHTML).join('');
-clips.forEach((_,i)=>sync(i));
+clips.forEach((_,i)=>{sync(i);refreshText(i)});
 $('#vtitle').textContent=D.title||'Clip editor';
 select(0);
 
@@ -1604,8 +1982,14 @@ $('#list').addEventListener('click',e=>{
  else if(a==='now'&&ready)setTime(i,b.dataset.w,player.getCurrentTime());
  else if(a==='s')setTime(i,'start',c.start+ +b.dataset.d);
  else if(a==='e')setTime(i,'end',c.end+ +b.dataset.d)
+ else if(a==='dlclip')downloadClip(i,b)
  else if(a==='center'){c.cx=.5;c.cy=.5;sync(i)}
- else if(a==='rcenter'){const r=c[b.dataset.r];r.x=.5;r.y=.5;sync(i)}});
+ else if(a==='rcenter'){const r=c[b.dataset.r];r.x=.5;r.y=.5;sync(i)}
+ else if(a==='addtext'){if(c.texts.length>=10)return msg('Up to 10 texts per clip.',true);
+  c.texts.push(newText(c.texts.length));c.ti=c.texts.length-1;if(!c.width){c.width=1080;c.height=1920}refreshText(i);sync(i)}
+ else if(a==='seltext'){c.ti=+b.dataset.n;refreshText(i);drawPreview()}
+ else if(a==='deltext'){c.texts.splice(c.ti,1);c.ti=Math.max(0,Math.min(c.ti,c.texts.length-1));refreshText(i);sync(i)}
+ else if(a==='tpos'){const t=c.texts[c.ti];if(t){t.x=.5;t.y=+b.dataset.y;syncTextPos(i);drawPreview()}}});
 $('#list').addEventListener('change',e=>{
  const card=e.target.closest('.card');if(!card)return;const i=+card.dataset.i,c=clips[i],t=e.target;
  if(t.classList.contains('en')){c.enabled=t.checked;sync(i)}
@@ -1616,8 +2000,10 @@ $('#list').addEventListener('change',e=>{
  else if(t.dataset.f==='start'||t.dataset.f==='end'){const v=parse(t.value);if(isNaN(v)){sync(i);$('#msg').textContent='Time format: 90, 1:30 or 1:02:03.5';return}setTime(i,t.dataset.f,v)}
  else if(t.dataset.f==='width'||t.dataset.f==='height'){const v=parseInt(t.value,10);c[t.dataset.f]=isNaN(v)?null:v;
   if(!c.width&&!c.height){c.width=c.height=null}sync(i)}});
-$('#list').addEventListener('input',e=>{const t=e.target;if(t.type!=='range')return;
+$('#list').addEventListener('input',e=>{const t=e.target;
  const card=t.closest('.card');if(!card)return;const i=+card.dataset.i,c=clips[i];
+ if(t.dataset.tf){textInput(c,i,t);return}
+ if(t.type!=='range')return;
  if(t.classList.contains('zoom'))c[t.dataset.r].z=t.value/100;
  else if(t.classList.contains('ratio'))c.ratio=t.value/100;
  sync(i)});
@@ -1638,7 +2024,7 @@ $('#showcrop').addEventListener('change',overlay);
 })();
 let scrubbing=false;const scrub=$('#scrub');
 $('#pp').addEventListener('click',()=>{if(!ready)return;if(player.getPlayerState()===1)player.pauseVideo();else player.playVideo()});
-scrub.addEventListener('input',()=>{scrubbing=true;if(ready&&duration){player.seekTo(scrub.value/1000*duration,true);stopAt=null}});
+scrub.addEventListener('input',()=>{scrubbing=true;const[b,l]=scrubSpan();if(ready&&l){player.seekTo(b+scrub.value/1000*l,true);stopAt=null}});
 scrub.addEventListener('change',()=>{scrubbing=false});
 
 function banner(text){const b=$('#banner');b.textContent=text;b.style.display='block'}
@@ -1650,7 +2036,7 @@ window.onYouTubeIframeAPIReady=()=>{ytPlayer=player=new YT.Player('player',{vide
 if(!D.local){const s=document.createElement('script');s.src='https://www.youtube.com/iframe_api';document.head.appendChild(s);
  setTimeout(()=>{if(!ready&&!local)banner('The YouTube preview is slow or not loading. Press “Download the video first” below to edit from the file instead.')},15000)}
 setInterval(()=>{if(!ready)return;const t=player.getCurrentTime();$('#now').textContent=fmt(t);
- if(!scrubbing&&duration)scrub.value=Math.round(Math.min(1,t/duration)*1000);
+ const[sb,sl]=scrubSpan();if(!scrubbing&&sl)scrub.value=Math.round(Math.max(0,Math.min(1,(t-sb)/sl))*1000);
  if(stopAt!==null&&t>=stopAt){player.pauseVideo();stopAt=null}},120);
 
 function destroyYT(){if(ytPlayer){try{ytPlayer.destroy()}catch(e){}ytPlayer=null}}
@@ -1663,14 +2049,28 @@ function startLocal(){
  v.addEventListener('loadedmetadata',()=>{
   if(v.videoWidth&&v.videoHeight){SA=v.videoWidth/v.videoHeight;box.style.aspectRatio=v.videoWidth+' / '+v.videoHeight;
    box.style.maxWidth='calc(78vh * '+SA+')';box.style.margin='0 auto'}
+  if(PARTS.length){const first=!player;
+   if(first)player={
+    seekTo:t=>{const i=partFor(t),rel=Math.max(0,t-PARTS[i].start);
+     if(i!==curPart){ready=false;pendingSeek=rel;curPart=i;v.src='/video'+location.search+'&part='+i+'&v='+Date.now()}else v.currentTime=rel},
+    playVideo:()=>{if(ready)v.play();else wantPlay=true},
+    pauseVideo:()=>{wantPlay=false;v.pause()},
+    getCurrentTime:()=>(PARTS[curPart]?PARTS[curPart].start:0)+v.currentTime,
+    getDuration:()=>duration,getPlayerState:()=>v.paused?2:1};
+   ready=true;
+   if(pendingSeek!==null){v.currentTime=pendingSeek;pendingSeek=null;if(wantPlay){wantPlay=false;v.play()}}
+   if(first){duration=D.duration||duration;$('#total').textContent=fmt(duration);clips.forEach((_,i)=>sync(i));seek(clips[active].start)}
+   return}
   player={seekTo:t=>{v.currentTime=t},playVideo:()=>v.play(),pauseVideo:()=>v.pause(),getCurrentTime:()=>v.currentTime,
    getDuration:()=>v.duration,getPlayerState:()=>v.paused?2:1};
   ready=true;duration=v.duration||duration;$('#total').textContent=fmt(duration);clips.forEach((_,i)=>sync(i));seek(clips[active].start)});
  v.addEventListener('error',()=>{banner('Your browser cannot play the downloaded file. Press “Make a smaller preview copy” (it can take a few minutes for a long video).');
-  $('#pv').style.display='';$('#pv').disabled=false});
- v.src='/video'+location.search+'&v='+Date.now();
+  $('#pv').style.display='';$('#pv').disabled=false;$('#pv').textContent=PARTS.length?'Make smaller preview copies':'Make a smaller preview copy'});
+ if(PARTS.length){curPart=partFor(clips[active].start);v.src='/video'+location.search+'&part='+curPart+'&v='+Date.now()}
+ else v.src='/video'+location.search+'&v='+Date.now();
  $('#dl').style.display='none';
- $('#lbtext').textContent='Editing from the downloaded video file ✓  You can jump anywhere, even in a very long video.'}
+ $('#lbtext').textContent=PARTS.length?'Editing from the downloaded clip parts ✓  Each clip has 10 s extra before and after - move the start/end anywhere inside it.'
+  :'Editing from the downloaded video file ✓  You can jump anywhere, even in a very long video.'}
 function post(action){return fetch('/action'+location.search,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action})}).then(r=>r.json())}
 async function pollState(){
  try{const r=await fetch('/state'+location.search);const s=await r.json();const t=s.task||{},p=$('#dlp');
@@ -1688,11 +2088,29 @@ $('#pv').addEventListener('click',()=>runAction('preview',$('#pv')));
 if(D.local){localVersion=D.version;startLocal()}
 
 function msg(t,bad){const m=$('#msg');m.textContent=t;m.className=bad?'bad':''}
+function clipPayload(c){return {rank:c.rank,title:c.title,description:c.description,start:c.start,end:c.end,width:c.width||null,height:c.height||null,
+ crop_x:c.cx,crop_y:c.cy,layout:c.layout,split:{ratio:c.ratio,top:c.top,bottom:c.bottom},texts:exportTexts(c)}}
+async function downloadClip(i,btn){
+ const c=clips[i],e=validate(c);if(e)return msg(`Clip #${c.rank}: ${e}.`,true);
+ const label=btn.textContent;btn.disabled=true;msg(`Clip #${c.rank}: starting…`);
+ try{
+  const r=await fetch('/clip'+location.search,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({clips:[clipPayload(c)]})});
+  const j=await r.json();if(!j.ok)throw new Error(j.error||'The app could not start this clip.');
+  for(;;){
+   await new Promise(res=>setTimeout(res,800));
+   const st=await (await fetch('/clipstate'+location.search+'&id='+j.id)).json();
+   if(st.error){throw new Error(st.error)}
+   if(st.status==='done'){
+    const a=document.createElement('a');a.href='/file'+location.search+'&id='+j.id;a.download=st.name||'clip.mp4';document.body.appendChild(a);a.click();a.remove();
+    msg(`Clip #${c.rank} saved: ${st.path}`);break}
+   btn.textContent='⏳ '+Math.round(st.percent||0)+'%';msg(`Clip #${c.rank}: ${st.message||'working…'}`)}
+ }catch(err){msg(err.message,true)}
+ btn.disabled=false;btn.textContent=label}
 $('#gen').addEventListener('click',async()=>{
  const out=[];let bad='';
  clips.forEach(c=>{if(!c.enabled)return;const e=validate(c);if(e&&!bad)bad=`Clip #${c.rank}: ${e}.`;
   out.push({rank:c.rank,title:c.title,description:c.description,start:c.start,end:c.end,width:c.width||null,height:c.height||null,crop_x:c.cx,crop_y:c.cy,
-  layout:c.layout,split:{ratio:c.ratio,top:c.top,bottom:c.bottom}})});
+  layout:c.layout,split:{ratio:c.ratio,top:c.top,bottom:c.bottom},texts:exportTexts(c)})});
  if(bad)return msg(bad,true);
  if(!out.length)return msg('Tick at least one clip.',true);
  const btn=$('#gen');btn.disabled=true;msg('Sending to the app…');
@@ -1708,10 +2126,11 @@ msg(`${clips.length} clips ready to edit.`);
 class EditorServer:
     """Tiny local web server (127.0.0.1 only, random port, secret token) that serves the editor page."""
 
-    def __init__(self, session, on_generate, on_action):
+    def __init__(self, session, on_generate, on_action, on_clip=None):
         self.session = session
         self.on_generate = on_generate
         self.on_action = on_action
+        self.on_clip = on_clip
         self.token = secrets.token_urlsafe(16)
         outer = self
 
@@ -1731,8 +2150,11 @@ class EditorServer:
             def _authorised(self, parsed):
                 return parse_qs(parsed.query).get("t", [""])[0] == outer.token
 
-            def _send_video(self):
-                path = outer.session.play_path
+            def _send_video(self, parsed):
+                if outer.session.parts:  # clip-parts mode: /video?part=N
+                    path = outer.session.part_path(parse_qs(parsed.query).get("part", ["0"])[0])
+                else:
+                    path = outer.session.play_path
                 try:
                     size = Path(path).stat().st_size
                 except (TypeError, OSError):
@@ -1788,25 +2210,49 @@ class EditorServer:
                 elif parsed.path == "/state":
                     self._send(200, json.dumps(outer.session.state()), "application/json; charset=utf-8")
                 elif parsed.path == "/video":
-                    self._send_video()
+                    self._send_video(parsed)
+                elif parsed.path == "/clipstate":
+                    job = outer.session.clip_jobs.get(parse_qs(parsed.query).get("id", [""])[0])
+                    self._send(200 if job else 404, json.dumps(job or {"error": "Unknown clip."}),
+                               "application/json; charset=utf-8")
+                elif parsed.path == "/file":
+                    job = outer.session.clip_jobs.get(parse_qs(parsed.query).get("id", [""])[0])
+                    path = Path(job["path"]) if job and job.get("path") else None
+                    if path is None or not path.is_file():
+                        self._send(404, "Not found", "text/plain; charset=utf-8")
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Content-Length", str(path.stat().st_size))
+                    self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(path.name))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    try:
+                        with open(path, "rb") as handle:
+                            shutil.copyfileobj(handle, self.wfile, 1 << 20)
+                    except OSError:
+                        pass
                 else:
                     self._send(404, "Not found", "text/plain; charset=utf-8")
 
             def do_POST(self):
                 parsed = urlparse(self.path)
-                if parsed.path not in ("/generate", "/action") or not self._authorised(parsed):
+                if parsed.path not in ("/generate", "/action", "/clip") or not self._authorised(parsed):
                     self._send(404, "Not found", "text/plain; charset=utf-8")
                     return
                 try:
                     length = int(self.headers.get("Content-Length") or 0)
-                    if length <= 0 or length > 1_000_000:
+                    if length <= 0 or length > 60_000_000:  # text pictures can be a few MB
                         raise ValueError("Bad request size.")
                     data = json.loads(self.rfile.read(length).decode("utf-8"))
+                    extra = {}
                     if parsed.path == "/generate":
                         outer.on_generate(data)
+                    elif parsed.path == "/clip":
+                        extra = outer.on_clip(data) if outer.on_clip else {}
                     else:
                         outer.on_action(str(data.get("action", "")) if isinstance(data, dict) else "")
-                    reply = {"ok": True}
+                    reply = {"ok": True, **extra}
                     code = 200
                 except (ValueError, json.JSONDecodeError) as exc:
                     reply, code = {"ok": False, "error": str(exc)}, 400
@@ -2464,6 +2910,7 @@ class ViralClipsApp(ctk.CTk):
         self.post_context = None  # video title, link and transcript for the post copy
         self.posts = {}  # rank -> post copy written by Gemini
         self.video_cache = None  # the downloaded video, so it is never downloaded twice
+        self.parts_cache = None  # the downloaded clip parts (when only the clips are downloaded)
         self.video_lock = threading.Lock()
         self.last_output_folder = None
         self._alive = True
@@ -2476,6 +2923,7 @@ class ViralClipsApp(ctk.CTk):
         self.auto_var = tk.BooleanVar(value=False)  # editor is the default path
         self.status_var = tk.StringVar(value="Ready")
         self.download_first_var = tk.BooleanVar(value=False)  # download first, edit from the file
+        self.clip_parts_var = tk.BooleanVar(value=True)  # download only the clips (+10 s either side)
         self.post_var = tk.BooleanVar(value=True)  # write titles & hashtags after the clips are created
 
         self.build_ui()
@@ -2532,6 +2980,7 @@ class ViralClipsApp(ctk.CTk):
         self.instructions_box.insert("1.0", DEFAULT_INSTRUCTIONS)
 
         switches = [
+            (f"Long videos ({LONG_VIDEO_SECONDS // 60} min+): download only the clips (+{SECTION_PAD}s)", self.clip_parts_var, None),
             ("Download video first, edit from the file", self.download_first_var, None),
             ("Auto-write titles & hashtags for all clips", self.post_var, None),
             ("Skip the editor (create clips right after analysis)", self.auto_var, self.refresh_buttons),
@@ -2539,10 +2988,10 @@ class ViralClipsApp(ctk.CTk):
         for offset, (label, variable, command) in enumerate(switches):
             ctk.CTkSwitch(side, text=label, variable=variable, command=command, text_color=SOFT, font=font(13),
                           progress_color=ACCENT, button_color=TEXT, button_hover_color=SOFT).grid(
-                row=10 + offset, column=0, sticky="w", padx=20, pady=(2, 10 if offset < 2 else 14))
+                row=10 + offset, column=0, sticky="w", padx=20, pady=(2, 10 if offset < len(switches) - 1 else 14))
 
         status_box = ctk.CTkFrame(side, fg_color=BG, corner_radius=10)
-        status_box.grid(row=13, column=0, sticky="ew", padx=20, pady=(0, 20))
+        status_box.grid(row=10 + len(switches), column=0, sticky="ew", padx=20, pady=(0, 20))
         status_box.grid_columnconfigure(0, weight=1)
         self.key_label = ctk.CTkLabel(status_box, text="", anchor="w", justify="left", wraplength=290,
                                       font=font(12), text_color=SOFT)
@@ -2761,6 +3210,7 @@ class ViralClipsApp(ctk.CTk):
             cancel=threading.Event(),
             download_first=self.download_first_var.get(),
             auto_post=self.post_var.get(),
+            clip_parts_only=self.clip_parts_var.get(),
         )
         self.clear_results()
         self.app_state = "running"
@@ -2785,14 +3235,14 @@ class ViralClipsApp(ctk.CTk):
             return
         try:
             if self.editor_server is None:
-                self.editor_server = EditorServer(self.editor_session, self.editor_generate, self.editor_action)
+                self.editor_server = EditorServer(self.editor_session, self.editor_generate, self.editor_action, self.editor_clip)
             open_editor_window(self.editor_server.url)
             self.log("Clip editor opened. Set the times and sizes, then press 'Generate clips' there.")
         except Exception as exc:
             messagebox.showerror("Cannot open the editor", str(exc))
 
-    def editor_generate(self, data):
-        """Called from the editor's web server thread when the user presses Generate clips."""
+    def parse_editor_clips(self, data):
+        """Turn the clips sent by the editor page into Clip objects (raises ValueError for bad input)."""
         items = data.get("clips") if isinstance(data, dict) else None
         if not isinstance(items, list) or not items:
             raise ValueError("No clips were sent.")
@@ -2818,16 +3268,80 @@ class ViralClipsApp(ctk.CTk):
             title = str(item.get("title") or f"Clip {rank}").strip()[:200]
             layout = "split" if item.get("layout") == "split" else "single"
             split = normalize_split(item.get("split")) if layout == "split" else None
-            if layout == "split" and size is None:
+            texts = []
+            raw_texts = item.get("texts") if isinstance(item.get("texts"), list) else []
+            for text_number, raw_text in enumerate(raw_texts[:MAX_TEXTS_PER_CLIP], 1):
+                png = decode_png_data_url(raw_text.get("png")) if isinstance(raw_text, dict) else None
+                if png is None:
+                    raise ValueError(f"Clip #{rank}: text {text_number} could not be read.")
+                texts.append({"png": png, "x": clamp01(raw_text.get("x"), 0.5), "y": clamp01(raw_text.get("y"), 0.85),
+                              "start": optional_seconds(raw_text.get("start")),
+                              "end": optional_seconds(raw_text.get("end"))})
+            if (layout == "split" or texts) and size is None:
                 size = VERTICAL_DEFAULT
             clips.append(Clip(rank, title, str(item.get("description") or "").strip(), start, end, size,
-                              clamp01(item.get("crop_x")), clamp01(item.get("crop_y")), layout, split))
+                              clamp01(item.get("crop_x")), clamp01(item.get("crop_y")), layout, split,
+                              texts or None))
+        return clips
+
+    def editor_generate(self, data):
+        """Called from the editor's web server thread when the user presses Generate clips."""
+        clips = self.parse_editor_clips(data)
         waiter = self.review_waiter
         if waiter is None or self.app_state != "review":
             raise ValueError("The app is not waiting for clips right now.")
         self.review_waiter = None
         self.events.put(("state", "running"))
         waiter.resolve(("edited", clips))
+
+    def editor_clip(self, data):
+        """'Download this clip' in the editor: cut ONE clip with all its edits, now, while the editor stays open."""
+        session, job = self.editor_session, self.job
+        if session is None or job is None:
+            raise ValueError("The editor is not ready.")
+        clips = self.parse_editor_clips(data)
+        if len(clips) != 1:
+            raise ValueError("Send exactly one clip.")
+        clip_id = secrets.token_hex(6)
+        session.clip_jobs[clip_id] = {"status": "working", "percent": 0, "message": "Starting…", "error": "",
+                                      "path": "", "name": ""}
+        threading.Thread(target=self._editor_clip_worker, args=(session, job, clips[0], clip_id), daemon=True).start()
+        return {"id": clip_id}
+
+    def _editor_clip_worker(self, session, job, clip, clip_id):
+        state = session.clip_jobs[clip_id]
+        try:
+            if job.video_duration:
+                fitted, _dropped = fit_to_duration([clip], job.video_duration)
+                if not fitted:
+                    raise UserFacingError("This clip is outside the video length.")
+                clip = fitted[0]
+            cached = self.video_cache
+            source, cut_start, cut_end = None, clip.start, clip.end
+            if session.video_path:
+                source = session.video_path
+            elif cached and cached["key"] == (job.url, job.quality) and Path(cached["path"]).is_file():
+                source = cached["path"]
+            else:  # download just this clip (+ padding); parts that are already downloaded are reused
+                state.update(message=f"Downloading this clip (+{SECTION_PAD}s before and after)…", percent=10)
+                parts = self.ensure_parts(job, [clip])
+                part = find_part(parts, clip)
+                if part is None:
+                    raise RuntimeError("This clip is outside the downloaded parts.")
+                source, cut_start, cut_end = part["path"], clip.start - part["start"], clip.end - part["start"]
+            state.update(message="Cutting the clip…", percent=60)
+            folder = OUTPUT_DIR / safe_name(session.title or "clips", 80)
+            folder.mkdir(parents=True, exist_ok=True)
+            out_path = unique_path(folder / f"{clip.rank:02d}_{safe_name(clip.title, 70)}.mp4")
+            cut_clip(source, out_path, cut_start, cut_end, clip_output_size(clip, job.ratio), job.cancel,
+                     clip.crop_x, clip.crop_y, clip.split if clip.layout == "split" else None, clip.texts)
+            state.update(status="done", percent=100, message="Saved", path=str(out_path), name=out_path.name)
+            self.log(f"Clip #{clip.rank} downloaded from the editor: {out_path}", "ok")
+        except JobCancelled:
+            state["error"] = "Cancelled."
+        except Exception as exc:
+            state["error"] = friendly_error(exc)
+            self.log(f"Download of clip #{clip.rank} failed: {friendly_error(exc)}", "error")
 
     def close_editor(self):
         server, self.editor_server = self.editor_server, None
@@ -3075,6 +3589,11 @@ class ViralClipsApp(ctk.CTk):
                                   "finished, then paste the link again.")
         title = info.get("title") or "YouTube video"
         duration = info.get("duration")
+        job.video_duration = duration
+        if duration and job.clip_parts_only and duration < LONG_VIDEO_SECONDS:
+            job.clip_parts_only = False  # short video: edit straight from YouTube, download only after Generate
+            self.log(f"Short video (under {LONG_VIDEO_SECONDS // 60} min): the editor plays it from YouTube, "
+                     "nothing is downloaded until you press Generate.")
         self.log(f"Video: {title}")
         if duration:
             self.log(f"Length: {format_timestamp(duration)}")
@@ -3253,12 +3772,24 @@ class ViralClipsApp(ctk.CTk):
                 raise
             except Exception:
                 pass
+        parts = None
+        if not video_path and job.clip_parts_only and clips:
+            cached = self.video_cache
+            if cached and cached["key"] == (job.url, job.quality) and Path(cached["path"]).is_file():
+                video_path = cached["path"]  # the full video is already on disk - just use it
+            else:  # download ONLY the clip parts (clip + padding) now, so the editor can play them
+                self.events.put(("state", "running"))
+                self.set_step(3, "active")
+                self.set_status(f"Downloading only the clips (each with {SECTION_PAD}s before and after)…")
+                parts = self.ensure_parts(job, clips)
+                self.set_step(3, "done")
+                self.log("Editing from the downloaded clip parts.", "ok")
         waiter = Waiter()
         self.review_waiter = waiter
         default_size = job.ratio
         self.editor_session = EditorSession(
             info.get("id", ""), title, duration, info.get("playable_in_embed") is not False,
-            clips, default_size, video_path)
+            clips, default_size, video_path, parts)
         self.events.put(("state", "review"))
         self.events.put(("open_editor", None))
         self.set_status("Set each clip's time and size in the editor, then press 'Generate clips' there. "
@@ -3291,6 +3822,32 @@ class ViralClipsApp(ctk.CTk):
             self.video_cache = {"key": key, "path": path, "info": info}
             return path, info
 
+    def ensure_parts(self, job, clips):
+        """Download only the clip parts (each clip + SECTION_PAD seconds either side). Reused if already downloaded."""
+        usable = fit_to_duration(clips, job.video_duration)[0] if job.video_duration else list(clips)
+        ranges = plan_sections(usable, job.video_duration)
+        if not ranges:
+            raise UserFacingError("None of the clips fit inside the video.")
+        key = (job.url, job.quality, tuple(ranges))
+        with self.video_lock:
+            cached = self.parts_cache
+            if (cached and cached["key"][:2] == (job.url, job.quality)
+                    and all(Path(p["path"]).is_file() for p in cached["parts"])
+                    and all(parts_cover(cached["parts"], clip) for clip in usable)):
+                return cached["parts"]  # already downloaded: the clips (even edited ones) fit inside
+            wanted = sum(b - a for a, b in ranges)
+            whole = f" instead of the whole {format_timestamp(job.video_duration)}" if job.video_duration else ""
+            self.log(f"Downloading only the clips: {len(ranges)} part(s), {format_timestamp(wanted)} in total{whole} "
+                     f"(each clip with {SECTION_PAD}s before and after).")
+            for begin, finish in ranges:
+                self.log(f"  part {format_timestamp(begin)} to {format_timestamp(finish)}")
+            self.set_status("Downloading the clip parts…")
+            parts, _info = download_clip_parts(job.url, job.quality, ranges, self.log, self.set_status,
+                                               self.set_progress, job.cancel)
+            self.log("Clip parts ready.", "ok")
+            self.parts_cache = {"key": key, "parts": parts}
+            return parts
+
     def editor_action(self, action):
         """Called from the editor's web server thread: 'download' the video or 'preview' (smaller copy)."""
         session, job = self.editor_session, self.job
@@ -3299,11 +3856,11 @@ class ViralClipsApp(ctk.CTk):
         if session.task.get("name"):
             raise ValueError("Please wait, the app is still working on the video.")
         if action == "download":
-            if session.video_path:
+            if session.video_path or session.parts:
                 raise ValueError("The video is already downloaded.")
             target = self._editor_download
         elif action == "preview":
-            if not session.video_path:
+            if not (session.video_path or session.parts):
                 raise ValueError("Download the video first.")
             target = self._editor_preview
         else:
@@ -3335,8 +3892,16 @@ class ViralClipsApp(ctk.CTk):
     def _editor_preview(self, session, job):
         try:
             session.set_task(message="Making a smaller preview copy…")
-            session.preview_path = make_preview(
-                session.video_path, job.cancel, lambda p: session.set_task(percent=int(p)))
+            if session.parts:  # one preview copy per downloaded clip part
+                count = len(session.parts)
+                for number, part in enumerate(session.parts):
+                    session.set_task(message=f"Making a smaller preview copy ({number + 1} of {count})…")
+                    part["preview"] = make_preview(
+                        part["path"], job.cancel,
+                        lambda p, n=number: session.set_task(percent=int((n + p / 100) / count * 100)))
+            else:
+                session.preview_path = make_preview(
+                    session.video_path, job.cancel, lambda p: session.set_task(percent=int(p)))
             session.version += 1
             session.set_task(name="", percent=100, message="", error="")
             self.log("Preview copy ready.", "ok")
@@ -3356,17 +3921,27 @@ class ViralClipsApp(ctk.CTk):
     def step_download_and_cut(self, job, title, clips):
         self.events.put(("state", "running"))
         self.set_step(3, "active")
-        video_path, dl_info = self.ensure_video(job)
+        cached = self.video_cache
+        have_full = bool(cached and cached["key"] == (job.url, job.quality) and Path(cached["path"]).is_file())
+        parts = None
+        if job.clip_parts_only and clips and not have_full:
+            parts = self.ensure_parts(job, clips)  # only the clips (+ padding), not the whole video
+            video_path, dl_info = None, {}
+        else:
+            video_path, dl_info = self.ensure_video(job)
         self.set_step(3, "done")
         self.set_progress(70)
 
-        try:
-            true_duration = probe_duration(video_path, job.cancel)
-        except JobCancelled:
-            raise
-        except Exception as exc:
-            self.log(f"Could not measure the video length ({exc}). Using the length from YouTube.", "warn")
-            true_duration = float(dl_info.get("duration") or 0) or None
+        if parts is not None:
+            true_duration = job.video_duration
+        else:
+            try:
+                true_duration = probe_duration(video_path, job.cancel)
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                self.log(f"Could not measure the video length ({exc}). Using the length from YouTube.", "warn")
+                true_duration = float(dl_info.get("duration") or 0) or None
 
         # Map clip -> its card index (cards were built from the full list)
         index_by_rank = {card.clip.rank: i for i, card in enumerate(self.cards)}
@@ -3399,9 +3974,15 @@ class ViralClipsApp(ctk.CTk):
             self.events.put(("clip_status", (card_index, "Creating…", ACCENT, None)))
             self.log(f"[{position}/{len(clips)}] {clip.title} ({clip.start:.1f}s to {clip.end:.1f}s)")
             try:
-                cut_clip(video_path, out_path, clip.start, clip.end,
+                source, cut_start, cut_end = video_path, clip.start, clip.end
+                if parts is not None:  # times inside the downloaded part start at 0
+                    part = find_part(parts, clip)
+                    if part is None:
+                        raise RuntimeError("This clip is outside the downloaded parts.")
+                    source, cut_start, cut_end = part["path"], clip.start - part["start"], clip.end - part["start"]
+                cut_clip(source, out_path, cut_start, cut_end,
                          clip_output_size(clip, job.ratio), job.cancel, clip.crop_x, clip.crop_y,
-                         clip.split if clip.layout == "split" else None)
+                         clip.split if clip.layout == "split" else None, clip.texts)
                 ok += 1
                 self.log(f"  Saved {out_path.name}", "ok")
                 saved.append((clip, out_path))
